@@ -152,6 +152,10 @@ export function configTemplate({ stateDir } = {}) {
       allowRemoteDelete: true,
     },
     sources: [
+      // Managed PDFs, catalog and the private paper-library state. The state
+      // directory holds small, frequently rewritten files, so it is versioned
+      // daily rather than pushed into archived storage; keep it on a longer
+      // lifecycle rule than current/ if you add one.
       {
         id: 'paper-library',
         kind: 'paper-library',
@@ -162,12 +166,12 @@ export function configTemplate({ stateDir } = {}) {
         required: false,
       },
       {
-        id: 'knowledge',
+        id: 'paper-library-state',
         kind: 'directory',
         root: '~/.dsh/paper-library',
-        remote: 'knowledge',
+        remote: 'paper-library-state',
         include: [],
-        exclude: ['**/*.lock', '**/runs/**'],
+        exclude: ['**/*.lock', '**/runs/**', '**/*.tmp'],
         required: false,
       },
       {

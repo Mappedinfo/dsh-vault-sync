@@ -73,7 +73,8 @@ node scripts/install-harness.mjs --harness /absolute/deepseek-harness --home /ab
   "sources": [
     { "id": "paper-library", "kind": "paper-library", "root": "~/.local/share/dsh-paper-library", "remote": "paper-library",
       "exclude": ["backups/**", "**/*.tmp", "**/.DS_Store"] },
-    { "id": "knowledge", "kind": "directory", "root": "~/.dsh/paper-library", "exclude": ["**/*.lock"] },
+    { "id": "paper-library-state", "kind": "directory", "root": "~/.dsh/paper-library",
+      "exclude": ["**/*.lock", "**/runs/**", "**/*.tmp"] },
     { "id": "obsidian-vault", "kind": "directory", "root": "~/Documents/my-vault",
       "exclude": [".git/**", ".trash/**", ".obsidian/workspace.json"] }
   ]
@@ -102,7 +103,7 @@ rclone 传输没有摘要元数据，因此"大小一致但无法证明相同"�
 <tempPrefix>/<runId>/<source.remote>/<相对路径>           本轮上传中，永不作为正式副本
 ```
 
-归档用服务端复制，不重新下载。OSS 侧建议再加生命周期规则：`current/` 30 天后转归档存储，`versions/` 180 天后删除。
+归档用服务端复制，不重新下载。OSS 侧建议再加生命周期规则：`current/paper-library/` 30 天后转归档存储，`versions/` 180 天后删除。文献库状态、知识文件与 Obsidian 仓库属于**频繁改写的小文件**，建议给它们单独的、更长的转换时间（或保持标准存储），否则小文件（不足 64 KiB 按 64 KiB 计费）的归档费用与重复版本量都会偏高。
 
 ## 恢复
 
