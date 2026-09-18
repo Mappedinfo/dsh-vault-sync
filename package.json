@@ -1,0 +1,41 @@
+{
+  "name": "@mappedinfo/dsh-vault-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent one-way versioned backup of local research data to Aliyun OSS for DeepSeek Harness",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/mappedinfo/dsh-vault-sync.git" },
+  "homepage": "https://github.com/mappedinfo/dsh-vault-sync#readme",
+  "bugs": { "url": "https://github.com/mappedinfo/dsh-vault-sync/issues" },
+  "type": "module",
+  "engines": { "node": "^22.19.0 || >=24" },
+  "main": "./src/harness/index.mjs",
+  "bin": { "vault-sync": "./src/cli.mjs" },
+  "exports": {
+    ".": "./src/harness/index.mjs",
+    "./core": "./src/core/engine.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/**/*.mjs",
+    "skills",
+    "cordis.patch.yml",
+    "README.md",
+    "HANDOFF.md",
+    "CHANGELOG.md",
+    "THIRD_PARTY.md",
+    "docs",
+    "LICENSE",
+    "licenses",
+    "scripts/install-harness.mjs"
+  ],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "validate": "node scripts/validate.mjs",
+    "install:harness": "node scripts/install-harness.mjs"
+  },
+  "dependencies": {},
+  "peerDependencies": { "@deepseek-ai/dsh-tools": ">=0.1.5-rc.2 <0.2.0" },
+  "peerDependenciesMeta": { "@deepseek-ai/dsh-tools": { "optional": true } }
+}

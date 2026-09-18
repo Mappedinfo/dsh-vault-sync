@@ -1,0 +1,11 @@
+# dsh-vault-sync host row. One insert mounts the vault_sync_* tools.
+# The plugin runs the vault-sync CLI in a short-lived child process; scheduling
+# is delegated to dsh-cron-scheduler (or the system crontab) and is not owned here.
+- insert:
+    - id: vault-sync
+      name: '@mappedinfo/dsh-vault-sync'
+      config:
+        # Absolute path to config.json. Empty means $DSH_HOME/vault-sync/config.json.
+        configPath: !!js process.env.DSH_VAULT_SYNC_CONFIG
+        # Ask before an upload; planning, status, verify and cost are read-only.
+        requireToolApproval: true

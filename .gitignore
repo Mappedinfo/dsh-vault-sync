@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+node_modules/
+.DS_Store
+.data/
+.local/
+.env
+*.env
+!oss.env.example
+*.log
+coverage/
+artifacts/
