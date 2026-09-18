@@ -46,6 +46,12 @@ test('sub-64KiB objects are billed at the minimum size', () => {
   assert.equal(result.perYear.egress, 0)
 })
 
+test('the unit string and currency are reported separately', () => {
+  const result = estimateCosts({ storedBytes: 0, objectCount: 0, uploadedBytes: 0, uploadedObjects: 0, fullDownloadsPerYear: 0, sporadicObjects: 0 })
+  assert.equal(result.currency, 'CNY')
+  assert.equal(result.unit, 'decimal GB (10^9 bytes); CNY rates')
+})
+
 test('a zero-object remote costs nothing and reports its assumptions', () => {
   const result = estimateCosts({ storedBytes: 0, objectCount: 0, uploadedBytes: 0, uploadedObjects: 0, fullDownloadsPerYear: 0, sporadicDownloadsPerYear: 0 })
   assert.equal(result.totalPerYear, 0)

@@ -60,7 +60,7 @@ export function estimateCosts(input, rates = DEFAULT_RATES) {
 
   return {
     pricingVersion: PRICING_VERSION,
-    unit: 'decimal GB (10^9 bytes), CNY',
+    unit: 'decimal GB (10^9 bytes); CNY rates',
     rates,
     assumptions: {
       egressWindow,

@@ -232,7 +232,7 @@ async function commandCost(options) {
     egressWindow: options.egressWindow ?? 'busy',
   }, DEFAULT_RATES)
   const text = [
-    `vault-sync cost estimate (${estimates.pricingVersion}, ${estimates.unit}, ${estimates.currency})`,
+    `vault-sync cost estimate (${estimates.pricingVersion}; ${estimates.unit})`,
     `  mirrored now   ${objects.length} objects, ${formatBytes(storedBytes || indexedBytes)} (${storedBytes === 0 ? 'from the local index' : 'from the remote listing'})`,
     `  assumptions    ${estimates.assumptions.fullDownloadsPerYear} full downloads/yr, ${estimates.assumptions.sporadicObjects} partial/yr, ${estimates.assumptions.egressWindow} egress window`,
     '',
