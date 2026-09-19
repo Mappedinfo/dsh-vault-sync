@@ -1,5 +1,5 @@
 /** Bounded, dependency-free helpers shared by the sync core. */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, posix, sep } from 'node:path'
@@ -35,7 +35,10 @@ export async function readJson(path) {
 /** Atomic write: temp file in the same directory, fsync'd content, then rename. */
 async function atomicWrite(path, data, mode) {
   await mkdir(dirname(path), { recursive: true })
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`
+  // The suffix must be unique per call, not per millisecond: concurrent writers
+  // (the applier uploads several files at once) otherwise collide on one temp
+  // name and the second rename fails with ENOENT.
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${randomBytes(6).toString('hex')}`
   const handle = await open(tmp, 'w', mode)
   try {
     await handle.writeFile(data)

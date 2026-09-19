@@ -31,12 +31,21 @@ function requireAbsolute(value, label) {
   return resolve(expanded)
 }
 
-function assertNoSecrets(value, path = 'config') {
-  if (Array.isArray(value)) { value.forEach((entry, index) => assertNoSecrets(entry, `${path}[${index}]`)); return }
+/**
+ * The rule is that a secret *value* never enters this file. One key is exempt
+ * because it names where the secrets are kept rather than holding one:
+ * \`credentialsFile\`. Its value is validated as an absolute path by
+ * normalizeConfig, so it cannot smuggle a credential through.
+ */
+const SECRET_FIELD_EXEMPT = new Set(['credentialsFile'])
+
+function assertNoSecrets(value, path = 'config', { topLevel = true } = {}) {
+  if (Array.isArray(value)) { value.forEach((entry, index) => assertNoSecrets(entry, `${path}[${index}]`, { topLevel: false })); return }
   if (!value || typeof value !== 'object') return
   for (const [key, entry] of Object.entries(value)) {
-    if (SECRET_FIELD.test(key)) fail(`${path}.${key} is not allowed in config; put secrets in oss.env or the environment`)
-    assertNoSecrets(entry, `${path}.${key}`)
+    const exempt = topLevel && path === 'config' && SECRET_FIELD_EXEMPT.has(key)
+    if (!exempt && SECRET_FIELD.test(key)) fail(`${path}.${key} is not allowed in config; put secrets in oss.env or the environment`)
+    assertNoSecrets(entry, `${path}.${key}`, { topLevel: false })
   }
 }
 
@@ -54,6 +63,10 @@ function normalizeSource(raw, index) {
   if (raw.exclude !== undefined && (!Array.isArray(raw.exclude) || raw.exclude.some(v => typeof v !== 'string'))) fail(`${label}.exclude must be a string array`)
   if (raw.maxFileBytes !== undefined && (!Number.isSafeInteger(raw.maxFileBytes) || raw.maxFileBytes <= 0)) fail(`${label}.maxFileBytes must be a positive integer`)
   if (raw.required !== undefined && typeof raw.required !== 'boolean') fail(`${label}.required must be boolean`)
+  // Per-source override of the remote deletion policy. A collection that must
+  // keep every historical copy sets this to false: a local move or delete then
+  // leaves the old remote object in place instead of removing it.
+  if (raw.allowRemoteDelete !== undefined && typeof raw.allowRemoteDelete !== 'boolean') fail(`${label}.allowRemoteDelete must be boolean`)
   return {
     id,
     kind,
@@ -63,6 +76,8 @@ function normalizeSource(raw, index) {
     exclude: raw.exclude ?? [],
     maxFileBytes: raw.maxFileBytes ?? 512 * 1024 * 1024,
     required: raw.required ?? false,
+    // undefined means "inherit the remote-level setting".
+    ...(raw.allowRemoteDelete === undefined ? {} : { allowRemoteDelete: raw.allowRemoteDelete }),
   }
 }
 
@@ -89,6 +104,16 @@ function normalizeRemote(raw) {
   if (raw.timeoutSeconds !== undefined && (!Number.isSafeInteger(raw.timeoutSeconds) || raw.timeoutSeconds < 5 || raw.timeoutSeconds > 3600)) fail('remote.timeoutSeconds must be an integer from 5 to 3600')
   if (raw.versionRetentionDays !== undefined && (!Number.isSafeInteger(raw.versionRetentionDays) || raw.versionRetentionDays < 1 || raw.versionRetentionDays > 3650)) fail('remote.versionRetentionDays must be an integer from 1 to 3650')
   if (raw.allowRemoteDelete !== undefined && typeof raw.allowRemoteDelete !== 'boolean') fail('remote.allowRemoteDelete must be boolean')
+  // 'direct' uploads straight to the final key (one request, no reliance on
+  // CopyObject); 'temp-copy' stages to a temp key and publishes server-side.
+  // What a failed version-archive copy means. 'warn' (default) keeps the run
+  // going so the current data is still backed up; 'fail' stops the file. The
+  // archive protects history, and failing the whole file to save a historical
+  // copy of it gets the tradeoff backwards.
+  const archiveFailure = raw.archiveFailure ?? 'warn'
+  if (!['warn', 'fail'].includes(archiveFailure)) fail('remote.archiveFailure must be warn or fail')
+  const publishStrategy = raw.publishStrategy ?? 'direct'
+  if (!['direct', 'temp-copy'].includes(publishStrategy)) fail('remote.publishStrategy must be direct or temp-copy')
   return {
     type,
     engine,
@@ -106,6 +131,8 @@ function normalizeRemote(raw) {
     retries: raw.retries ?? 5,
     timeoutSeconds: raw.timeoutSeconds ?? 300,
     allowRemoteDelete: raw.allowRemoteDelete ?? true,
+    publishStrategy,
+    archiveFailure,
   }
 }
 
@@ -120,12 +147,16 @@ export function normalizeConfig(raw, { configPath } = {}) {
     if (new Set(values).size !== values.length) fail(`source ${field} values must be unique`)
   }
   const stateDir = raw.stateDir ? requireAbsolute(raw.stateDir, 'stateDir') : defaultStateHome()
+  // Secrets still never live in this file: this only names where they are kept,
+  // so a checkout-local or otherwise relocated credentials file can be used.
+  const credentialsFile = raw.credentialsFile === undefined ? undefined : requireAbsolute(raw.credentialsFile, 'credentialsFile')
   const localRuns = raw.localRuns ?? 200
   if (!Number.isSafeInteger(localRuns) || localRuns < 10 || localRuns > 10000) fail('localRuns must be an integer from 10 to 10000')
   return {
     version: CONFIG_VERSION,
     configPath: configPath ? resolve(configPath) : undefined,
     stateDir,
+    credentialsFile,
     remote: normalizeRemote(raw.remote),
     sources,
     localRuns,

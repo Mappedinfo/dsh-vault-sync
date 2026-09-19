@@ -46,8 +46,10 @@ const KEY_GROUPS = {
  * Precedence: private env file, then process environment. Missing values stay
  * undefined so the caller can report them factually instead of guessing.
  */
-export async function resolveCredentials({ configDir, env = process.env } = {}) {
-  const envFilePath = configDir && isAbsolute(configDir) ? join(configDir, ENV_FILE_NAME) : undefined
+export async function resolveCredentials({ configDir, filePath, env = process.env } = {}) {
+  const envFilePath = filePath
+    ? (isAbsolute(filePath) ? filePath : undefined)
+    : (configDir && isAbsolute(configDir) ? join(configDir, ENV_FILE_NAME) : undefined)
   const fileVars = envFilePath ? await readEnvFile(envFilePath) : {}
   const pick = names => {
     for (const name of names) {

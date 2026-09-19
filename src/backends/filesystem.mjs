@@ -1,8 +1,13 @@
 /**
  * Local-filesystem remote: the reference transport and the test harness.
- * It reproduces the OSS transport semantics exactly (versioned backups,
- * in-flight temp keys, digest metadata) with no network access, so the whole
- * engine can be exercised end to end on synthetic data.
+ * It reproduces the OSS transport's semantics (versioned backups, in-flight
+ * temp keys, digest metadata) with no network access, so the whole engine can
+ * be exercised end to end on synthetic data.
+ *
+ * Metadata lives in one sidecar document per remote, so every change is a
+ * read-modify-write that runs inside a per-path queue: the applier uploads
+ * several files at once and concurrent writers would otherwise each persist a
+ * document missing the other's entry.
  */
 import { copyFile, mkdir, readFile, rm, stat } from 'node:fs/promises'
 import { dirname, join, relative, sep } from 'node:path'
@@ -11,22 +16,38 @@ import { listFiles, pathExists, readJson, sha256File, toPosixPath, writeJsonAtom
 
 export const META_FILE = '.vault-sync-meta.json'
 
+const writeQueues = new Map()
+function enqueueWrite(path, task) {
+  const previous = writeQueues.get(path) ?? Promise.resolve()
+  const next = previous.then(task, task)
+  writeQueues.set(path, next.catch(() => {}))
+  return next
+}
+
 export function createFilesystemBackend({ root }) {
   const metaPath = join(root, META_FILE)
   const resolve = key => {
     assertSafeKey(key)
     return join(root, key.split('/').join(sep))
   }
-  let metaCache
 
+  /** Read the shared metadata document, returning the objects map. */
   const loadMeta = async () => {
-    if (!metaCache) metaCache = (await readJson(metaPath)) ?? { objects: {} }
-    if (!metaCache.objects) metaCache.objects = {}
-    return metaCache
+    const document = (await readJson(metaPath)) ?? { objects: {} }
+    return document.objects ?? {}
   }
-  const saveMeta = async () => { await writeJsonAtomic(metaPath, metaCache, { mode: 0o600 }) }
-  const digestFor = (meta, key, size) => {
-    const recorded = meta.objects[key]
+
+  /** Read-modify-write of the shared document, serialized per remote. */
+  const updateMeta = mutate => enqueueWrite(metaPath, async () => {
+    const document = (await readJson(metaPath)) ?? { objects: {} }
+    if (!document.objects) document.objects = {}
+    mutate(document.objects)
+    await writeJsonAtomic(metaPath, document, { mode: 0o600 })
+    return document.objects
+  })
+
+  const digestFor = (objects, key, size) => {
+    const recorded = objects[key]
     return recorded && recorded.size === size && typeof recorded.digest === 'string' ? recorded.digest : undefined
   }
 
@@ -41,7 +62,7 @@ export function createFilesystemBackend({ root }) {
       } catch (error) {
         throw new BackendError(`list failed: ${error.message}`, { operation: 'list' })
       }
-      const meta = await loadMeta()
+      const objects = await loadMeta()
       const normalized = prefix.replace(/^\/+|\/+$/g, '')
       const out = []
       for (const absolute of all) {
@@ -49,7 +70,7 @@ export function createFilesystemBackend({ root }) {
         if (key === META_FILE) continue
         if (normalized && key !== normalized && !key.startsWith(`${normalized}/`)) continue
         const info = await stat(absolute)
-        const digest = digestFor(meta, key, info.size)
+        const digest = digestFor(objects, key, info.size)
         out.push({ key, size: info.size, mtimeMs: info.mtimeMs, digest, digestSource: digest ? 'metadata' : undefined })
       }
       return out
@@ -59,8 +80,7 @@ export function createFilesystemBackend({ root }) {
       const target = resolve(key)
       if (!(await pathExists(target))) return undefined
       const info = await stat(target)
-      const meta = await loadMeta()
-      const digest = digestFor(meta, key, info.size)
+      const digest = digestFor(await loadMeta(), key, info.size)
       return { key, size: info.size, mtimeMs: info.mtimeMs, digest, digestSource: digest ? 'metadata' : undefined }
     },
 
@@ -76,10 +96,11 @@ export function createFilesystemBackend({ root }) {
       if (Number.isFinite(size) && info.size !== size) {
         throw new BackendError(`putFile ${key} size mismatch: wrote ${info.size}, expected ${size}`, { operation: 'putFile', key })
       }
-      const meta = await loadMeta()
-      meta.objects[key] = { size: info.size, digest: digest ?? (await sha256File(target)), at: new Date().toISOString() }
-      await saveMeta()
-      return { key, size: info.size, digest: meta.objects[key].digest }
+      const resolved = digest ?? (await sha256File(target))
+      await updateMeta(objects => {
+        objects[key] = { size: info.size, digest: resolved, at: new Date().toISOString() }
+      })
+      return { key, size: info.size, digest: resolved }
     },
 
     async copy(fromKey, toKey) {
@@ -88,17 +109,15 @@ export function createFilesystemBackend({ root }) {
       if (!(await pathExists(source))) throw new BackendError(`copy source missing: ${fromKey}`, { operation: 'copy', key: fromKey })
       await mkdir(dirname(target), { recursive: true })
       await copyFile(source, target)
-      const meta = await loadMeta()
-      if (meta.objects[fromKey]) {
-        meta.objects[toKey] = { ...meta.objects[fromKey], at: new Date().toISOString() }
-        await saveMeta()
+      const recorded = (await loadMeta())[fromKey]
+      if (recorded) {
+        await updateMeta(objects => { objects[toKey] = { ...recorded, at: new Date().toISOString() } })
       }
     },
 
     async remove(key) {
       await rm(resolve(key), { force: true })
-      const meta = await loadMeta()
-      if (meta.objects[key]) { delete meta.objects[key]; await saveMeta() }
+      await updateMeta(objects => { delete objects[key] })
     },
 
     async readText(key) {

@@ -88,6 +88,8 @@ export function planSource({ files, remote, layout, remoteName, previous = {}, s
         items.push({ action: 'version', relPath, key: entry.key, size: entry.size, digest: entry.digest, versionKey: layout.versionKey(stamp, remoteName, relPath), reason: 'local-deleted' })
         items.push({ action: 'delete', relPath, key: entry.key, size: entry.size, digest: entry.digest, reason: 'local-deleted' })
       } else {
+        // Append-only source: the local file is gone but its remote copy is
+        // history and stays. Reported so the reader can see it was noticed.
         items.push({ action: 'skip', relPath, key: entry.key, size: entry.size, remoteOnly: true, reason: 'local-deleted-keep-remote' })
       }
       continue

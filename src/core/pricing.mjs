@@ -1,13 +1,31 @@
 /**
- * Cost estimation from the plan figures. Rates are transcribed from the
- * reviewed design's Aliyun OSS price table (archived, timely retrieval) and are
- * configuration, not measurements: the tool reports the rate set it used and
- * never presents the result as a bill.
+ * Cost estimation from the plan figures.
+ *
+ * Rates are transcribed from the reviewed design's price table and corrected
+ * against the Aliyun OSS pricing page for China (Beijing) on 2026-09-18. Two
+ * official details matter and were wrong in the first version of this module:
+ *
+ *   1. OSS bills in binary GB (1 GB = 2^30 bytes, i.e. GiB), not decimal GB.
+ *   2. Standard (LRS) storage is free for the first 5 GB in every region shown
+ *      on the pricing page, which dominates the cost of a small mirror.
+ *
+ * Rates are configuration, not measurements: the tool reports the rate set it
+ * used and never presents the result as a bill.
  */
-export const PRICING_VERSION = '2026-09 (design table)'
+export const PRICING_VERSION = '2026-09-18 (Aliyun OSS pricing page, China/Beijing)'
+
+/** OSS bills binary GB (2^30 bytes), which the page also calls GiB. */
+export const GiB = 1024 * 1024 * 1024
 
 export const DEFAULT_RATES = {
-  archiveStoragePerGbMonth: 0.033,
+  /** Archive (LRS), USD 0.00405/GB-month, converted at 7.2 CNY/USD. */
+  archiveStoragePerGbMonth: 0.029,
+  /** Low-frequency (LRS), USD 0.00935/GB-month. */
+  infrequentStoragePerGbMonth: 0.067,
+  /** Standard (LRS), USD 0.0160/GB-month. */
+  standardStoragePerGbMonth: 0.115,
+  /** Standard (LRS) is free up to this much stored data, per region. */
+  standardFreeBytes: 5 * GiB,
   egressBusyPerGb: 0.5,
   egressIdlePerGb: 0.25,
   putPerMillion: 30,
@@ -15,10 +33,10 @@ export const DEFAULT_RATES = {
   restorePerGb: 0.072,
   minBillableObjectBytes: 64 * 1024,
   archiveMinimumDays: 60,
+  infrequentMinimumDays: 30,
 }
 
-/** OSS bills in decimal GB (10^9 bytes), not GiB. */
-export const GB = 1_000_000_000
+export const USD_TO_CNY = 7.2
 
 /**
  * @param {object} input
@@ -26,6 +44,8 @@ export const GB = 1_000_000_000
  * @param {number} input.objectCount
  * @param {number} input.uploadedBytes      bytes transferred this run
  * @param {number} input.uploadedObjects
+ * @param {'archive'|'standard'|'infrequent'} [input.storageClass]  where the mirror settles
+ * @param {number} [input.standardBytes]    bytes that stay on standard storage
  * @param {number} [input.fullDownloadsPerYear]   full-library retrievals per year
  * @param {number} [input.fullDownloadBytes]      egress per full retrieval (defaults to storedBytes)
  * @param {number} [input.sporadicBytes]          total egress of all partial retrievals per year
@@ -38,6 +58,8 @@ export function estimateCosts(input, rates = DEFAULT_RATES) {
     objectCount = 0,
     uploadedBytes = 0,
     uploadedObjects = 0,
+    storageClass = 'archive',
+    standardBytes = 0,
     fullDownloadsPerYear = 2,
     fullDownloadBytes = storedBytes,
     sporadicBytes = 0,
@@ -45,14 +67,29 @@ export function estimateCosts(input, rates = DEFAULT_RATES) {
     egressWindow = 'busy',
   } = input
 
-  // Objects below 64 KiB are billed as 64 KiB by OSS.
-  const billableBytes = Math.max(storedBytes, objectCount * rates.minBillableObjectBytes)
-  const storagePerYear = (billableBytes / GB) * rates.archiveStoragePerGbMonth * 12
+  // Archive, infrequent and cold classes bill a 64 KiB minimum per object;
+  // standard bills the real size.
+  const billableBytes = storageClass === 'standard'
+    ? storedBytes
+    : Math.max(storedBytes, objectCount * rates.minBillableObjectBytes)
+  const ratePerGbMonth = storageClass === 'standard'
+    ? rates.standardStoragePerGbMonth
+    : storageClass === 'infrequent'
+      ? rates.infrequentStoragePerGbMonth
+      : rates.archiveStoragePerGbMonth
+
+  // The free allowance applies to standard storage only, and only to the data
+  // that actually stays standard.
+  const freeAllowance = storageClass === 'standard'
+    ? Math.min(rates.standardFreeBytes, billableBytes)
+    : Math.min(standardBytes, rates.standardFreeBytes)
+  const chargedBytes = Math.max(0, billableBytes - freeAllowance)
+  const storagePerYear = (chargedBytes / GiB) * ratePerGbMonth * 12
 
   const egressBytes = fullDownloadsPerYear * fullDownloadBytes + sporadicBytes
   const egressPerGb = egressWindow === 'idle' ? rates.egressIdlePerGb : rates.egressBusyPerGb
-  const egressPerYear = (egressBytes / GB) * egressPerGb
-  const restorePerYear = (egressBytes / GB) * rates.restorePerGb
+  const egressPerYear = (egressBytes / GiB) * egressPerGb
+  const restorePerYear = (egressBytes / GiB) * rates.restorePerGb
 
   const putPerYear = (uploadedObjects / 1_000_000) * rates.putPerMillion
   const getPerYear = ((fullDownloadsPerYear * objectCount + sporadicObjects) / 1_000_000) * rates.getPerMillion
@@ -60,19 +97,29 @@ export function estimateCosts(input, rates = DEFAULT_RATES) {
 
   return {
     pricingVersion: PRICING_VERSION,
-    unit: 'decimal GB (10^9 bytes); CNY rates',
+    currency: 'CNY',
+    unit: 'binary GB (2^30 bytes, GiB)',
     rates,
     assumptions: {
+      storageClass,
       egressWindow,
       fullDownloadsPerYear,
       sporadicObjects,
+      freeStandardAllowanceBytes: rates.standardFreeBytes,
       archiveMinimumDays: rates.archiveMinimumDays,
-      note: 'Storage assumes every object reaches archived storage; a 60-day minimum applies and sub-64 KiB objects are billed as 64 KiB.',
+      infrequentMinimumDays: rates.infrequentMinimumDays,
+      note: 'Standard (LRS) storage is free up to 5 GiB per region. Archive and infrequent classes bill a 64 KiB minimum per object and have 60- and 30-day minimum storage durations, so keep the versions prefix on standard storage if it is deleted on a schedule.',
+      usdToCny: USD_TO_CNY,
     },
     inputs: {
       storedBytes,
       objectCount,
       billableBytes,
+      /** The nominal free allowance for this storage class (0 when none applies). */
+      nominalFreeAllowanceBytes: storageClass === 'standard' ? rates.standardFreeBytes : 0,
+      /** The part of that allowance actually used up by this mirror. */
+      freeAllowanceBytes: freeAllowance,
+      chargedBytes,
       uploadedBytes,
       uploadedObjects,
       egressBytes,
@@ -86,7 +133,6 @@ export function estimateCosts(input, rates = DEFAULT_RATES) {
       restoreRequests: round(restoreRequestsPerYear),
     },
     totalPerYear: round(storagePerYear + egressPerYear + restorePerYear + putPerYear + getPerYear + restoreRequestsPerYear),
-    currency: 'CNY',
   }
 }
 

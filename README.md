@@ -41,6 +41,7 @@ node src/cli.mjs plan       # 只看计划，不写任何东西
 node src/cli.mjs run        # 执行备份
 node src/cli.mjs verify     # 与远端镜像核对
 node src/cli.mjs cost       # 年费用算术估算
+node src/cli.mjs cost --storage-class standard   # 也可算 standard / infrequent / archive
 ```
 
 注册到本地 Harness profile（只改目标 profile，不动全局配置）：
@@ -68,7 +69,9 @@ node scripts/install-harness.mjs --harness /absolute/deepseek-harness --home /ab
     "concurrency": 16,                        // 1–24
     "retries": 5,
     "timeoutSeconds": 300,
-    "allowRemoteDelete": true
+    "allowRemoteDelete": true,
+    "publishStrategy": "direct",
+    "archiveFailure": "warn"
   },
   "sources": [
     { "id": "paper-library", "kind": "paper-library", "root": "~/.local/share/dsh-paper-library", "remote": "paper-library",
@@ -95,7 +98,39 @@ node scripts/install-harness.mjs --harness /absolute/deepseek-harness --home /ab
 
 rclone 传输没有摘要元数据，因此"大小一致但无法证明相同"的文件会报告为 `size-match-unverified`，不会被反复重传，也不会被宣称已核对。
 
+### 存储类型与生命周期（费用要点）
+
+阿里云 OSS 按**二进制 GB**（1 GB = 2³⁰ 字节）计费，几个官方规则直接决定这个备份该怎么做：
+
+| 规则 | 结论 |
+|:--|:--|
+| **标准存储 (LRS) 每地域前 5 GiB 免费** | 4 GiB 的库放标准存储，存储费为 **0**。不要为了"单价更低"去买存储包（最小规格 40 GB）或转低频——免费额度内转档只会把 0 元变成要付钱 |
+| 归档 60 天 / 低频 30 天**最低存储时长** | 不足期删除、覆盖或转档按剩余天数比例加收。**`versions/` 前缀必须留在标准存储**，否则"180 天到期删除"会变成罚款 |
+| 归档与低频按 **64 KiB 最小计费单位**，标准按实际大小 | 知识文件、Obsidian 笔记大量小于 64 KiB，转档后计费容量会虚高 |
+| 低频读取需先 `RestoreObject` 解冻 | 与归档同样的取回延迟；低频还比归档贵一倍 |
+
+因此推荐顺序：**先什么都不设**（标准存储 + 免费额度）→ 库明显超过 5 GiB 后，只给 `current/paper-library/` 加一条 30 天→归档规则 → 跳过低频。频繁改写的小文件（文献库状态、Obsidian 仓库）保持标准存储。
+
+费用看 `vault-sync cost`，可指定档位复算：
+
+```sh
+node src/cli.mjs cost                          # 默认按归档估算
+node src/cli.mjs cost --storage-class standard # 标准存储，含 5 GiB 免费额度
+node src/cli.mjs cost --egress idle            # 闲时（00:00-08:00）流出单价减半
+```
+
+真正的费用杠杆是**流出流量**而非存储：40 GiB 场景下流出约 43 元/年，是存储费的 3 倍多。闲时取回（0.25 元/GiB）比忙时（0.50）省一半，是最大的一项优化。
+
+### 发布与归档的取舍
+
+| 设置 | 默认 | 含义 |
+|:--|:--|:--|
+| `publishStrategy` | `direct` | 直接 PUT 到正式路径，再校验大小与摘要；`temp-copy` 则先传临时键再用服务端复制发布。`direct` 少两次往返、不依赖 `CopyObject`；代价是传输中断可能短暂留下不完整对象，靠随后的大小/摘要校验发现并重传 |
+| `archiveFailure` | `warn` | 归档旧版本失败时只记警告，**当前内容照常上传**；`fail` 则整文件失败 |
+| `allowRemoteDelete`（按源） | 继承 | 设为 `false` 的源**只增不减**：文件被移动或删除后，远端历史副本原地保留，并在报告中标记 `local-deleted-keep-remote` |
+
 ### 远端布局
+
 
 ```
 <currentPrefix>/<source.remote>/<相对路径>                当前镜像
@@ -154,7 +189,7 @@ cron 表达式按系统时区解释，不承诺秒级精度。
 ## 验证
 
 ```sh
-npm test                      # 76 项 JavaScript 测试，仅用合成数据与本地/进程内替身
+npm test                      # 80 项 JavaScript 测试，仅用合成数据与本地/进程内替身
 ```
 
 测试覆盖：SigV4 与 AWS 公开测试向量逐字节比对、配置与凭据规则、规划决策表、首次上传/幂等重跑/覆盖归档/本地删除归档/中断续传/临时对象清理/核对/版本定位/锁互斥、进程内 S3 兼容服务端到端（签名、分页、服务端复制、重试、错误映射）、rclone argv 构造与超时、Harness 工具映射与审批门、费用算术。详见 [验证记录](docs/validation.md)。

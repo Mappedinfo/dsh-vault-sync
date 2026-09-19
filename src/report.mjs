@@ -90,12 +90,13 @@ export function verifyReport(result) {
 export function statusReport(result) {
   let out = 'vault-sync status\n'
   out += `  engine   ${result.engine?.kind} (${result.engine?.detail})\n`
-  out += `  state    ${result.stateDir}\n\n`
+  out += `  state    ${result.stateDir}\n`
+  out += `  scope    ${result.remoteListed ? 'local index plus remote listing' : 'local index only (no remote call)'}\n\n`
   out += table(result.sources, [
     { header: 'source', value: row => row.id },
     { header: 'indexed', value: row => row.indexed },
     { header: 'indexed-bytes', value: row => row.indexedBytesHuman },
-    { header: 'remote-objects', value: row => row.remoteObjects },
+    ...(result.remoteListed ? [{ header: 'remote-objects', value: row => row.remoteObjects ?? 0 }] : []),
     { header: 'last-index', value: row => row.lastIndexedAt ?? '' },
   ])
   if (result.runs.length > 0) {

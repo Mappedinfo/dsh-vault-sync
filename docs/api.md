@@ -18,10 +18,10 @@ vault-sync <command> [options]
 | `restore` | 定位当前对象与日期版本 | 0 |
 | `sources` | 列出配置的源 | 0 |
 
-公共选项：`--config <绝对路径>`、`--source <id>`（可重复）、`--json`、`--help`。
+公共选项：`--config <绝对路径>`、`--source <id>`（可重复）、`--json`、`--help`。`status` 另有 `--remote`：默认只读本地索引（零网络），该开关会额外列举远端前缀（计费，与对象数成正比）。
 `run` 另有 `--dry-run`（等价 `plan`）与 `--quiet`（仅打印一行摘要；`--json` 优先）。
 `verify` 另有 `--sample <n>`。`restore` 另有 `--stamp YYYY-MM-DD`。
-`cost` 另有 `--full-downloads <n>`、`--sporadic-gb <n>`、`--sporadic-objects <n>`、`--egress busy|idle`。
+`cost` 另有 `--full-downloads <n>`、`--sporadic-gb <n>`、`--sporadic-objects <n>`、`--storage-class standard|infrequent|archive`、`--egress busy|idle`。
 
 `--json` 输出是稳定契约；人类可读输出仅为便利，不保证逐字稳定。
 

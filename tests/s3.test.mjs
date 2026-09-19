@@ -83,7 +83,7 @@ test('uploads land under current/ and carry the sha256 object metadata', async (
   }
 })
 
-test('modified files are versioned by server-side copy, not re-download', async () => {
+test('a modified file is archived by server-side copy and re-uploaded directly', async () => {
   const h = await s3Harness()
   try {
     await writeFiles(h.library, { 'a.pdf': 'one' })
@@ -95,14 +95,34 @@ test('modified files are versioned by server-side copy, not re-download', async 
     assert.equal(h.server.keyOf('versions/2026-05-06/papers/a.pdf').body.toString(), 'one')
     assert.equal(h.server.keyOf('current/papers/a.pdf').body.toString(), 'two-longer')
     const copies = h.server.requests.filter(request => Boolean(request.copySource))
-    // Run 1 publishes current/papers/a.pdf from incoming/; run 2 archives the old
-    // content and publishes the new one: three server-side copies in total and
-    // no object download anywhere.
-    assert.equal(copies.length, 3)
-    assert.equal(copies.filter(request => request.copySource.startsWith('/test-bucket/incoming/')).length, 2)
-    const archive = copies.find(request => request.copySource === '/test-bucket/current/papers/a.pdf')
-    assert.ok(archive, 'the replaced version should be archived from current/')
-    assert.equal(archive.key, 'versions/2026-05-06/papers/a.pdf')
+    // Archive only: the replacement content is uploaded straight to its final
+    // key, so publishing never depends on CopyObject.
+    assert.equal(copies.length, 1, 'exactly one archive copy is expected')
+    assert.equal(copies[0].copySource, '/test-bucket/current/papers/a.pdf')
+    assert.equal(copies[0].key, 'versions/2026-05-06/papers/a.pdf')
+    const gets = h.server.requests.filter(request => request.method === 'GET' && !request.query['list-type'])
+    assert.equal(gets.length, 0, 'no object is downloaded to archive a version')
+  } finally {
+    await h.server.close()
+    await cleanup(h.root)
+  }
+})
+
+test('publishStrategy=temp-copy stages through incoming/ and publishes server-side', async () => {
+  const h = await s3Harness()
+  try {
+    h.config.remote.publishStrategy = 'temp-copy'
+    const { createEngine: makeEngine } = await import('../src/core/engine.mjs')
+    const engine = makeEngine({ config: h.config, backend: h.backend, now: () => new Date('2026-05-06T00:00:00Z') })
+    await writeFiles(h.library, { 'a.pdf': 'alpha' })
+    const result = await engine.run({})
+    assert.equal(result.totals.upload, 1)
+    assert.deepEqual(h.server.keys(), ['current/papers/a.pdf'])
+    const copies = h.server.requests.filter(request => Boolean(request.copySource))
+    assert.equal(copies.length, 1)
+    assert.ok(copies[0].copySource.startsWith('/test-bucket/incoming/'))
+    assert.equal(copies[0].key, 'current/papers/a.pdf')
+    assert.deepEqual(h.server.keys().filter(k => k.startsWith('incoming/')), [], 'the staged object is removed after publishing')
   } finally {
     await h.server.close()
     await cleanup(h.root)
@@ -159,7 +179,8 @@ test('an unrecoverable server error surfaces as a failed item, not a crash', asy
     await writeFiles(h.library, { 'a.pdf': 'alpha' })
     // Fail every object upload, but keep listing and metadata requests healthy,
     // so the failure is attributable to one file rather than to the transport.
-    h.server.failWhen((method, key) => method === 'PUT' && !key.startsWith('current/') && !key.startsWith('versions/'))
+    // Fail the publish PUT (the direct path writes straight to current/).
+    h.server.failWhen((method, key) => method === 'PUT' && key.startsWith('current/'))
     const result = await h.engine.run({})
     assert.equal(result.totals.failed, 1)
     assert.equal(result.record.status, 'partial')
@@ -196,5 +217,85 @@ test('verify over the S3 transport matches stored metadata digests', async () =>
   } finally {
     await h.server.close()
     await cleanup(h.root)
+  }
+})
+
+test('a transport-level failure is retried instead of aborting the run', async () => {
+  // A VPN tunnel or flaky link drops the connection before any HTTP response:
+  // no HTTP status exists, so the retry decision must come from the error shape.
+  const { isTransportFailure } = await import('../src/backends/s3.mjs')
+  assert.equal(isTransportFailure({ cause: { code: 'UND_ERR_CONNECT_TIMEOUT' } }), true)
+  assert.equal(isTransportFailure({ cause: { code: 'ECONNRESET' } }), true)
+  assert.equal(isTransportFailure(new Error('fetch failed')), true)
+  assert.equal(isTransportFailure({ cause: { code: 'CERT_HAS_EXPIRED' } }), false)
+
+  const server = await startFakeS3()
+  const root = await tempDir('vault-transport-')
+  try {
+    const library = join(root, 'library')
+    await mkdir(library, { recursive: true })
+    await writeFiles(library, { 'a.pdf': 'alpha' })
+    let attempts = 0
+    const flakyFetch = async (url, init) => {
+      attempts += 1
+      if (attempts === 1) {
+        const error = new TypeError('fetch failed')
+        error.cause = { code: 'UND_ERR_CONNECT_TIMEOUT', message: 'Connect Timeout Error' }
+        throw error
+      }
+      return globalThis.fetch(url, init)
+    }
+    const config = configFor({ endpoint: server.endpoint, bucket: server.bucket, stateDir: join(root, 'state'), root: library })
+    const backend = createS3Backend({ ...CREDENTIALS, endpoint: server.endpoint, bucket: server.bucket, forcePathStyle: true, retries: 2, timeoutSeconds: 10, fetchImpl: flakyFetch })
+    const engine = createEngine({ config, backend, now: () => new Date('2026-05-06T00:00:00Z') })
+    const result = await engine.run({})
+    assert.equal(result.totals.failed, 0, 'a dropped connection must be retried, not reported as a file failure')
+    assert.equal(result.totals.upload, 1)
+    assert.ok(attempts > 1)
+  } finally {
+    await server.close()
+    await cleanup(root)
+  }
+})
+
+test('a signature mismatch is retried, but a bad credential is not', async () => {
+  // A VPN tunnel can corrupt a request in flight; OSS then reports a signature
+  // mismatch for a request whose signature is fine. That is recoverable.
+  // A genuinely wrong AccessKey is not, and must fail fast.
+  const { isRetryableHttpFailure } = await import('../src/backends/s3.mjs')
+  assert.equal(isRetryableHttpFailure(403, 'SignatureDoesNotMatch'), true)
+  assert.equal(isRetryableHttpFailure(403, 'RequestTimeTooSkewed'), true)
+  assert.equal(isRetryableHttpFailure(503, 'ServiceUnavailable'), true)
+  assert.equal(isRetryableHttpFailure(403, 'InvalidAccessKeyId'), false)
+  assert.equal(isRetryableHttpFailure(403, 'AccessDenied'), false)
+  assert.equal(isRetryableHttpFailure(404, 'NoSuchKey'), false)
+})
+
+test('a transient signature failure during copy is retried and the run survives', async () => {
+  const server = await startFakeS3()
+  const root = await tempDir('vault-sigretry-')
+  try {
+    const library = join(root, 'library')
+    await mkdir(library, { recursive: true })
+    await writeFiles(library, { 'a.pdf': 'alpha' })
+    let injected = 0
+    const flakyFetch = async (url, init) => {
+      // Fail the first copy with a signature mismatch, then behave normally.
+      if (init?.method === 'PUT' && String(url).includes('/current/') && injected === 0) {
+        injected += 1
+        return new Response('<Error><Code>SignatureDoesNotMatch</Code><Message>injected</Message></Error>', { status: 403, headers: { 'content-type': 'application/xml' } })
+      }
+      return globalThis.fetch(url, init)
+    }
+    const config = configFor({ endpoint: server.endpoint, bucket: server.bucket, stateDir: join(root, 'state'), root: library })
+    const backend = createS3Backend({ ...CREDENTIALS, endpoint: server.endpoint, bucket: server.bucket, forcePathStyle: true, retries: 3, timeoutSeconds: 10, fetchImpl: flakyFetch })
+    const engine = createEngine({ config, backend, now: () => new Date('2026-05-06T00:00:00Z') })
+    const result = await engine.run({})
+    assert.equal(injected, 1, 'the injected failure should have been attempted')
+    assert.equal(result.totals.failed, 0, 'the retry should have published the object')
+    assert.equal(result.totals.upload, 1)
+  } finally {
+    await server.close()
+    await cleanup(root)
   }
 })

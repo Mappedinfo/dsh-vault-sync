@@ -4,7 +4,7 @@
 
 ## 当前状态（2026-09-18，v0.1.0）
 
-可用：把配置好的本地目录**单向、可版本化**地备份到阿里云 OSS，并提供核对、版本定位与费用估算。76 项测试与可复现端到端校验通过（`npm test`、`node scripts/validate.mjs`）。没有真实 OSS 桶、真实 rclone 或真实 Harness 运行时的验证，详见[验证记录](docs/validation.md#4-尚未验证)。
+可用：把配置好的本地目录**单向、可版本化**地备份到阿里云 OSS，并提供核对、版本定位与费用估算。80 项测试与可复现端到端校验通过（`npm test`、`node scripts/validate.mjs`）。没有真实 OSS 桶、真实 rclone 或真实 Harness 运行时的验证，详见[验证记录](docs/validation.md#4-尚未验证)。
 
 ### 代码地图
 
@@ -57,7 +57,7 @@
 ## 继续开发
 
 ```sh
-npm test                  # 76 项
+npm test                  # 80 项
 node scripts/validate.mjs # 测试 + 真实本地端到端 + Harness 契约
 ```
 

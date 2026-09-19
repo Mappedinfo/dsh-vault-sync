@@ -7,7 +7,7 @@ import { configTemplate, defaultConfigPath, readConfig, writeConfig } from './co
 import { ENV_FILE_NAME, envFileModeReport, resolveCredentials } from './core/credentials.mjs'
 import { createBackend, createEngine } from './core/engine.mjs'
 import { formatBytes, pathExists } from './core/util.mjs'
-import { DEFAULT_RATES, estimateCosts } from './core/pricing.mjs'
+import { DEFAULT_RATES, GiB, estimateCosts } from './core/pricing.mjs'
 import { jsonReport, planReport, runReport, statusReport, verifyReport } from './report.mjs'
 
 const USAGE = `vault-sync — one-way versioned backup of local research data to Aliyun OSS
@@ -27,6 +27,7 @@ Commands
 
 Common options
   --config <path>      config file (default $DSH_HOME/vault-sync/config.json)
+                       config.credentialsFile may point elsewhere for oss.env
   --source <id>        limit to one source (repeatable)
   --json               machine-readable output
   --help               this text
@@ -39,6 +40,7 @@ verify options
   --sample <n>         check at most n files per source
 
 cost options
+  --storage-class <class>   standard | infrequent | archive (default archive)
   --full-downloads <n>      full-library retrievals per year (default 2)
   --sporadic-gb <n>         partial-retrieval egress per year in GB (default 6)
   --sporadic-objects <n>    partial retrievals per year (default 3000)
@@ -46,6 +48,9 @@ cost options
 
 restore options
   --stamp <YYYY-MM-DD> pin a dated version
+
+status options
+  --remote             also list the remote prefixes (billed, proportional to object count)
 `
 
 function parseArgs(argv) {
@@ -64,6 +69,8 @@ function parseArgs(argv) {
     else if (arg === '--sporadic-gb') options.sporadicGb = Number(argv[++i])
     else if (arg === '--sporadic-objects') options.sporadicObjects = Number(argv[++i])
     else if (arg === '--egress') options.egressWindow = argv[++i]
+    else if (arg === '--storage-class') options.storageClass = argv[++i]
+    else if (arg === '--remote') options.remote = true
     else if (arg === '--help' || arg === '-h') options.help = true
     else if (arg.startsWith('-')) throw new Error(`unknown option ${arg}`)
     else rest.push(arg)
@@ -73,7 +80,7 @@ function parseArgs(argv) {
 
 async function loadEngine(options) {
   const config = await readConfig(options.config ?? defaultConfigPath())
-  const credentials = await resolveCredentials({ configDir: config.stateDir })
+  const credentials = await resolveCredentials({ configDir: config.credentialsFile ? undefined : config.stateDir, filePath: config.credentialsFile })
   const { backend, engine, notes } = await createBackend(config, { credentials })
   return { engine: createEngine({ config, backend }), config, credentials, transport: engine, notes }
 }
@@ -141,12 +148,14 @@ async function commandDoctor(options) {
       detail: present ? source.root : `${source.root} (missing${source.required ? ', required' : ', optional'})`,
     })
   }
-  const credentials = await resolveCredentials({ configDir: config.stateDir })
-  const mode = await envFileModeReport(join(config.stateDir, ENV_FILE_NAME))
+  const credentials = await resolveCredentials({ configDir: config.credentialsFile ? undefined : config.stateDir, filePath: config.credentialsFile })
+  const mode = await envFileModeReport(credentials.envFilePath)
   checks.push({
     name: 'secrets-file',
     ok: mode.exists ? mode.private : true,
-    detail: mode.exists ? `${ENV_FILE_NAME} mode ${mode.mode}${mode.private ? '' : ' (should be 0600)'}` : 'not present; environment variables only',
+    detail: mode.exists
+      ? `${credentials.envFilePath} mode ${mode.mode}${mode.private ? '' : ' (should be 0600)'}`
+      : `no credentials file at ${credentials.envFilePath}; environment variables only`,
   })
   if (config.remote.type === 'oss') {
     for (const label of ['accessKeyId', 'accessKeySecret']) {
@@ -201,7 +210,8 @@ async function commandRun(options) {
 
 async function commandStatus(options) {
   const { engine } = await loadEngine(options)
-  const result = await engine.status({ runs: 10 })
+  // Local by default: listing the remote is billed and proportional to size.
+  const result = await engine.status({ runs: 10, remote: options.remote === true })
   print(options.json ? result : statusReport(result), options)
   return 0
 }
@@ -220,20 +230,24 @@ async function commandCost(options) {
   const objectCount = objects.length
   const indexes = await Promise.all(config.sources.map(async source => (await engine.journal.readIndex(source.id)).entries ?? {}))
   const indexedBytes = indexes.reduce((sum, entries) => sum + Object.values(entries).reduce((inner, entry) => inner + (entry.size ?? 0), 0), 0)
+  const storageClass = options.storageClass ?? 'archive'
+  if (!['standard', 'infrequent', 'archive'].includes(storageClass)) throw new Error('--storage-class must be standard, infrequent or archive')
   const estimates = estimateCosts({
     storedBytes: storedBytes || indexedBytes,
     objectCount,
     uploadedBytes: indexedBytes,
     uploadedObjects: objectCount,
+    storageClass,
     fullDownloadsPerYear: options.fullDownloads ?? 2,
     fullDownloadBytes: storedBytes || indexedBytes,
-    sporadicBytes: (options.sporadicGb ?? 6) * 1_000_000_000,
+    sporadicBytes: (options.sporadicGb ?? 6) * GiB,
     sporadicObjects: options.sporadicObjects ?? 3000,
     egressWindow: options.egressWindow ?? 'busy',
   }, DEFAULT_RATES)
   const text = [
     `vault-sync cost estimate (${estimates.pricingVersion}; ${estimates.unit})`,
     `  mirrored now   ${objects.length} objects, ${formatBytes(storedBytes || indexedBytes)} (${storedBytes === 0 ? 'from the local index' : 'from the remote listing'})`,
+    `  storage class  ${estimates.assumptions.storageClass}${estimates.inputs.nominalFreeAllowanceBytes > 0 ? `, ${formatBytes(estimates.inputs.freeAllowanceBytes)} of ${formatBytes(estimates.inputs.nominalFreeAllowanceBytes)} free allowance used` : ''}`,
     `  assumptions    ${estimates.assumptions.fullDownloadsPerYear} full downloads/yr, ${estimates.assumptions.sporadicObjects} partial/yr, ${estimates.assumptions.egressWindow} egress window`,
     '',
     `  storage        ${estimates.perYear.storage}`,
@@ -243,6 +257,9 @@ async function commandCost(options) {
     `  total / year   ${estimates.totalPerYear}`,
     '',
     '  This is an arithmetic estimate from configured rates, not a bill and not a measurement.',
+    `  Rates: ${estimates.pricingVersion}. Standard (LRS) storage is free up to 5 GiB per region;`,
+    '  archive and infrequent classes bill a 64 KiB minimum per object and have 60/30-day',
+    '  minimum storage durations, so keep the versions prefix on standard storage.',
     '',
   ].join('\n')
   print(options.json ? estimates : text, options)

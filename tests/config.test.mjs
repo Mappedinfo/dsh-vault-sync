@@ -84,3 +84,34 @@ test('default config keeps secrets out and points at absolute paths', () => {
   assert.equal(normalized.stateDir, join('/', 'tmp', 'state'))
   assert.ok(normalized.sources.every(source => source.root.startsWith('/')))
 })
+
+test('credentialsFile is optional but must be absolute, and is never a secret itself', () => {
+  const template = configTemplate({ stateDir: '/tmp/state' })
+  assert.equal(normalizeConfig(template).credentialsFile, undefined)
+  assert.equal(normalizeConfig({ ...template, credentialsFile: '/tmp/vault-sync/oss.env' }).credentialsFile, '/tmp/vault-sync/oss.env')
+  assert.throws(() => normalizeConfig({ ...template, credentialsFile: 'oss.env' }), /absolute path/)
+  assert.throws(() => normalizeConfig({ ...template, credentialsFile: '/tmp/x', accessKeyId: 'LTAI' }), /not allowed in config/)
+})
+
+test('concurrent atomic writes to one path never collide on a temp file', async () => {
+  // Regression: the temp name used to be pid+millisecond, so two writers in the
+  // same millisecond fought over one temp file and the second rename failed.
+  const { writeJsonAtomic, readJson, writeTextAtomic } = await import('../src/core/util.mjs')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const dir = await mkdtemp(join(tmpdir(), 'vault-atomic-'))
+  try {
+    const target = join(dir, 'shared.json')
+    await Promise.all(Array.from({ length: 40 }, (_, i) => writeJsonAtomic(target, { i })))
+    const value = await readJson(target)
+    assert.ok(value && Number.isInteger(value.i), 'the file must still hold one complete document')
+    const text = join(dir, 'shared.txt')
+    await Promise.all(Array.from({ length: 40 }, (_, i) => writeTextAtomic(text, `line-${i}\n`)))
+    const leftovers = (await (await import('node:fs/promises')).readdir(dir)).filter(name => name.includes('.tmp-'))
+    assert.deepEqual(leftovers, [], 'no temp files may be left behind')
+    const names = (await (await import('node:fs/promises')).readdir(dir)).sort()
+    assert.deepEqual(names, ['shared.json', 'shared.txt'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

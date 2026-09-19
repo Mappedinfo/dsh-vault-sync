@@ -161,3 +161,31 @@ test('the bundled skill parses with name, description and body', async () => {
   assert.equal(typeof dispose, 'function')
   assert.throws(() => registerBundledSkills({}), /register/)
 })
+
+test('an explicit credentialsFile is read from, and its absence is reported by path', async () => {
+  const root = await tempDir('vault-cred-')
+  try {
+    const { resolveCredentials } = await import('../src/core/credentials.mjs')
+    const stateDir = join(root, 'state')
+    const relocated = join(root, 'checkout', 'oss.env')
+    await writeFiles(root, { 'checkout/oss.env': 'OSS_ACCESS_KEY_ID=LTAI_TEST\nOSS_ACCESS_KEY_SECRET=secret_test\n' })
+
+    // The default state directory is not consulted when a file is named.
+    const explicit = await resolveCredentials({ filePath: relocated, env: {} })
+    assert.equal(explicit.accessKeyId, 'LTAI_TEST')
+    assert.equal(explicit.envFilePath, relocated)
+    assert.equal(explicit.sources.accessKeyId, 'env-file:OSS_ACCESS_KEY_ID')
+
+    const missing = await resolveCredentials({ filePath: join(root, 'absent.env'), env: {} })
+    assert.equal(missing.accessKeyId, undefined)
+    assert.equal(missing.envFilePath, join(root, 'absent.env'))
+    assert.deepEqual(missing.missing, ['accessKeyId', 'accessKeySecret'])
+
+    // A relative path is refused rather than resolved against the cwd.
+    const relative = await resolveCredentials({ filePath: 'oss.env', env: {} })
+    assert.equal(relative.envFilePath, undefined)
+    void stateDir
+  } finally {
+    await cleanup(root)
+  }
+})

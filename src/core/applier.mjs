@@ -10,8 +10,18 @@
  * runs are pruned explicitly and counted in the run record.
  */
 import { BackendError } from './backend.mjs'
+import { mapLimit } from './util.mjs'
 
-export function createApplier({ backend, layout, runId, sink = () => {}, maxTempKeysToPrune = 100000 } = {}) {
+export function createApplier({
+  backend,
+  layout,
+  runId,
+  sink = () => {},
+  maxTempKeysToPrune = 100000,
+  publishStrategy = 'direct',
+  concurrency = 8,
+  archiveFailure = 'warn',
+} = {}) {
   const failures = []
 
   async function applyItem(item) {
@@ -21,8 +31,16 @@ export function createApplier({ backend, layout, runId, sink = () => {}, maxTemp
       case 'version': {
         const existing = await backend.head(item.key)
         if (!existing) return { ...item, status: 'skipped', note: 'source-already-absent' }
-        await backend.copy(item.key, item.versionKey)
-        return { ...item, status: 'applied' }
+        try {
+          await backend.copy(item.key, item.versionKey)
+          return { ...item, status: 'applied' }
+        } catch (error) {
+          if (archiveFailure === 'fail') throw error
+          // The historical copy could not be written. Report it, but let the
+          // paired upload proceed: losing one archived revision is far less bad
+          // than leaving the current file unbacked-up.
+          return { ...item, status: 'warning', warning: error instanceof Error ? error.message : String(error) }
+        }
       }
       case 'delete': {
         const existing = await backend.head(item.key)
@@ -30,8 +48,25 @@ export function createApplier({ backend, layout, runId, sink = () => {}, maxTemp
         return { ...item, status: existing ? 'applied' : 'skipped', note: existing ? undefined : 'already-absent' }
       }
       case 'upload': {
-        const tempKey = layout.tempKey(runId, item.remoteName, item.relPath)
         if (!item.localPath) throw new BackendError(`upload item ${item.relPath} has no local path`, { operation: 'upload' })
+        // Direct publish: one PUT to the final key, then verify what landed.
+        // This avoids depending on server-side CopyObject, which some links and
+        // intermediaries handle unreliably, at the cost of a short window where
+        // an interrupted transfer could leave a partial object at the final key.
+        // The verification below is what closes that window: a size or digest
+        // mismatch fails the item, so the next run re-uploads it.
+        if (publishStrategy === 'direct') {
+          await backend.putFile(item.key, item.localPath, { size: item.size, digest: item.digest })
+          const landed = await backend.head(item.key)
+          if (!landed || (landed.size !== undefined && landed.size !== item.size)) {
+            throw new BackendError(`published object ${item.key} is missing or short`, { operation: 'verify', key: item.key, retryable: true })
+          }
+          if (landed.digest && landed.digest !== item.digest) {
+            throw new BackendError(`published object ${item.key} has digest ${landed.digest}, expected ${item.digest}`, { operation: 'verify', key: item.key })
+          }
+          return { ...item, status: 'applied', verified: Boolean(landed.digest) }
+        }
+        const tempKey = layout.tempKey(runId, item.remoteName, item.relPath)
         await backend.putFile(tempKey, item.localPath, { size: item.size, digest: item.digest })
         const written = await backend.head(tempKey)
         if (!written || (written.size !== undefined && written.size !== item.size)) {
@@ -53,25 +88,46 @@ export function createApplier({ backend, layout, runId, sink = () => {}, maxTemp
     }
   }
 
-  /** One source runs serially so archive-before-overwrite ordering always holds. */
-  async function applySource(source, items, { onItem } = {}) {
-    const results = []
+  /**
+   * Work is grouped per path and the groups run with bounded concurrency.
+   *
+   * Concurrency is per *file*, never within one: a file's own items keep their
+   * planner order, so the archive copy of a replaced version still happens
+   * before the new content is published. Files are independent of each other,
+   * so overlapping them is safe and is what makes a large library feasible:
+   * every request on a tunnelled link costs seconds of setup latency, and
+   * running them in series multiplies that by the file count.
+   */
+  async function applySource(source, items, { onItem, onGroup } = {}) {
+    const groups = []
+    const byPath = new Map()
     for (const item of items) {
-      const enriched = { ...item, sourceId: source.id, remoteName: source.remote, localPath: item.localPath ?? source.filePaths?.get(item.relPath) }
-      try {
-        const result = await applyItem(enriched)
-        results.push(result)
-        sink(result)
-        onItem?.(result)
-      } catch (error) {
-        const failure = { ...enriched, status: 'failed', error: error instanceof Error ? error.message : String(error), retryable: Boolean(error?.retryable) }
-        failures.push(failure)
-        results.push(failure)
-        sink(failure)
-        onItem?.(failure)
-      }
+      const key = item.relPath ?? ''
+      if (!byPath.has(key)) { const group = []; byPath.set(key, group); groups.push(group) }
+      byPath.get(key).push(item)
     }
-    return results
+
+    const perGroup = await mapLimit(groups, concurrency, async group => {
+      const results = []
+      for (const item of group) {
+        const enriched = { ...item, sourceId: source.id, remoteName: source.remote, localPath: item.localPath ?? source.filePaths?.get(item.relPath) }
+        try {
+          const result = await applyItem(enriched)
+          results.push(result)
+          sink(result)
+          onItem?.(result)
+        } catch (error) {
+          const failure = { ...enriched, status: 'failed', error: error instanceof Error ? error.message : String(error), retryable: Boolean(error?.retryable) }
+          failures.push(failure)
+          results.push(failure)
+          sink(failure)
+          onItem?.(failure)
+        }
+      }
+      onGroup?.(group, results)
+      return results
+    })
+    return perGroup.flat()
   }
 
   async function pruneTempKeys(remoteEntries) {

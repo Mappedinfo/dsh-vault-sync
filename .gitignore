@@ -1,14 +1,29 @@
-__pycache__/
-*.py[cod]
-.venv/
-dist/
-node_modules/
-.DS_Store
-.data/
-.local/
+# Secrets: never commit credentials. The example template is the only env file kept.
 .env
 *.env
 !oss.env.example
+oss.env
+*.pem
+*.key
+*.p12
+*.pfx
+.ossutilconfig
+.aws/
+.dsh/
+
+# Runtime state and output
+.data/
+.local/
 *.log
 coverage/
 artifacts/
+
+# Dependencies and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+node_modules/
+.DS_Store

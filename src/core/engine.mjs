@@ -26,7 +26,7 @@ export async function createBackend(config, { credentials, env = process.env } =
       notes: [RCLONE_NOTE],
     }
   }
-  const creds = credentials ?? await resolveCredentials({ configDir: config.stateDir, env })
+  const creds = credentials ?? await resolveCredentials({ configDir: config.credentialsFile ? undefined : config.stateDir, filePath: config.credentialsFile, env })
   const rcloneRemote = remote.rcloneRemote ?? creds.rcloneRemote
   if (remote.engine === 'rclone' || (remote.engine === 'auto' && rcloneRemote)) {
     if (!rcloneRemote) throw new Error('remote.engine=rclone but no rclone remote name is configured')
@@ -106,9 +106,16 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
         remoteName: source.remote,
         previous,
         stamp: stamp ?? versionStamp(now()),
-        allowRemoteDelete: config.remote.allowRemoteDelete,
+        allowRemoteDelete: source.allowRemoteDelete ?? config.remote.allowRemoteDelete,
       })
-      entries[source.id] = { source, scan, listing, previous, ...result }
+      entries[source.id] = {
+        source,
+        scan,
+        listing,
+        previous,
+        remoteDelete: source.allowRemoteDelete ?? config.remote.allowRemoteDelete,
+        ...result,
+      }
     }
     const summary = summarizePlan(Object.values(entries).map(entry => ({
       id: entry.source.id,
@@ -117,7 +124,7 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
       files: entry.scan.files,
       skipped: entry.scan.skipped,
       stats: entry.stats,
-    })))
+    }))).map((row, index) => ({ ...row, remoteDelete: Object.values(entries)[index].remoteDelete }))
     return { entries, summary, totals: totalStats(summary), tempKeys }
   }
 
@@ -137,20 +144,41 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
       if (dryRun) return { runId, dryRun: true, plan: planned, record: runRecord }
 
       const runPath = await journal.beginRun(runRecord)
-      const applier = createApplier({ backend, layout, runId, sink })
+      const applier = createApplier({ backend, layout, runId, sink, publishStrategy: config.remote.publishStrategy, concurrency: config.remote.concurrency, archiveFailure: config.remote.archiveFailure })
       const perSource = []
       let tempPruned = []
       try {
-        // One root listing covers temp-key cleanup and an object count for the
-        // run record; a transport that cannot list the root still syncs.
-        let rootListing = []
-        try { rootListing = await backend.list('') } catch { rootListing = [] }
-        tempPruned = await applier.pruneTempKeys(rootListing)
+        // Dead-run temp keys live under the temp prefix, which is not inside any
+        // source prefix, so cleaning them needs its own listing. It is scoped to
+        // that prefix instead of listing the whole bucket, which matters when the
+        // bucket holds tens of thousands of objects.
+        let tempListing = []
+        try { tempListing = await backend.list(layout.tempRoot) } catch { tempListing = [] }
+        tempPruned = await applier.pruneTempKeys(tempListing)
         for (const entry of Object.values(planned.entries)) {
           const source = entry.source
           const scan = entry.scan
           const filePaths = new Map(scan.files.map(file => [file.relPath, file.path]))
-          const results = await applier.applySource({ id: source.id, remote: source.remote, filePaths }, entry.items)
+          // Persist the digest index as work completes, not only at the end of a
+          // source. A run that dies at 99% (a hung proxy, a lost link, a reboot)
+          // would otherwise restart by re-hashing the whole tree, because the
+          // index never advanced. Every callback writes the same complete-file
+          // map, so a partially finished run still records durable progress.
+          const indexEntries = {}
+          const completed = new Set()
+          const results = await applier.applySource({ id: source.id, remote: source.remote, filePaths }, entry.items, {
+            onGroup: (group, groupResults) => {
+              const relPath = group[0]?.relPath
+              if (!relPath) return
+              const failed = groupResults.some(result => result.status === 'failed')
+              if (!failed) {
+                completed.add(relPath)
+                const file = scan.files.find(entry => entry.relPath === relPath)
+                if (file) indexEntries[relPath] = { size: file.size, mtimeMs: file.mtimeMs, digest: file.digest }
+              }
+              if (completed.size % 250 === 0) void journal.writeIndex(source.id, { ...indexEntries })
+            },
+          })
           const applied = results.filter(result => result.status === 'applied')
           const failed = results.filter(result => result.status === 'failed')
           perSource.push({
@@ -165,6 +193,7 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
             unchanged: results.filter(item => item.action === 'skip' && !item.remoteOnly).length,
             bytesUploaded: applied.filter(item => item.action === 'upload').reduce((sum, item) => sum + (item.size ?? 0), 0),
             failed: failed.map(item => ({ relPath: item.relPath, action: item.action, error: item.error, retryable: item.retryable })),
+            archiveWarnings: results.filter(item => item.status === 'warning').map(item => ({ relPath: item.relPath, versionKey: item.versionKey, warning: item.warning })),
           })
           // The index advances only for a source whose work fully succeeded, so a
           // partial run never claims a failed file is already backed up.
@@ -277,27 +306,33 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
     }
   }
 
-  async function status({ runs = 10 } = {}) {
-    const [recent, listings] = await Promise.all([
-      journal.listRuns(runs),
-      Promise.all(config.sources.map(async source => {
-        const index = await journal.readIndex(source.id)
+  /**
+   * @param {boolean} [options.remote] also list each remote prefix. A listing
+   *   is cheap per call but proportional to the object count, so the local view
+   *   (index + run ledger) is the default and costs nothing beyond disk reads.
+   */
+  async function status({ runs = 10, remote = false } = {}) {
+    const recent = await journal.listRuns(runs)
+    const sources = await Promise.all(config.sources.map(async source => {
+      const index = await journal.readIndex(source.id)
+      const entries = Object.values(index.entries ?? {})
+      const bytes = entries.reduce((sum, entry) => sum + (entry.size ?? 0), 0)
+      const row = {
+        id: source.id,
+        root: source.root,
+        remote: source.remote,
+        indexed: entries.length,
+        indexedBytes: bytes,
+        indexedBytesHuman: formatBytes(bytes),
+        lastIndexedAt: index.updatedAt,
+      }
+      if (remote) {
         const listing = await backend.list(layout.currentPrefix(source.remote))
-        const entries = Object.values(index.entries ?? {})
-        const bytes = entries.reduce((sum, entry) => sum + (entry.size ?? 0), 0)
-        return {
-          id: source.id,
-          root: source.root,
-          remote: source.remote,
-          indexed: entries.length,
-          indexedBytes: bytes,
-          indexedBytesHuman: formatBytes(bytes),
-          remoteObjects: listing.filter(entry => !entry.key.startsWith(`${layout.tempRoot}/`)).length,
-          lastIndexedAt: index.updatedAt,
-        }
-      })),
-    ])
-    return { engine: backend.describe(), stateDir: config.stateDir, sources: listings, runs: recent }
+        row.remoteObjects = listing.filter(entry => !entry.key.startsWith(`${layout.tempRoot}/`)).length
+      }
+      return row
+    }))
+    return { engine: backend.describe(), stateDir: config.stateDir, remoteListed: remote, sources, runs: recent }
   }
 
   function totalStats(list) {
@@ -311,6 +346,7 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
       const skippedLocal = entry.skippedLocal
       totals.skippedLocal += Array.isArray(skippedLocal) ? skippedLocal.length : (skippedLocal ?? 0)
       totals.failed += Array.isArray(entry.failed) ? entry.failed.length : (entry.failed ?? 0)
+      totals.archiveWarnings = (totals.archiveWarnings ?? 0) + (Array.isArray(entry.archiveWarnings) ? entry.archiveWarnings.length : 0)
       totals.bytesUploaded += entry.bytesUploaded ?? entry.bytesToUpload ?? 0
     }
     totals.bytesUploadedHuman = formatBytes(totals.bytesUploaded)

@@ -110,6 +110,30 @@ function errorFromXml(text, fallback) {
   return fallback
 }
 
+/**
+ * Transport-level failures (a VPN tunnel or flaky link dropping a connection)
+ * are retryable even though no HTTP response was ever received. Without this,
+ * a TUN-mode reconnect aborts the whole run instead of backing off.
+ */
+export function isTransportFailure(error) {
+  const code = error?.cause?.code ?? error?.code
+  const message = String(error?.cause?.message ?? error?.message ?? '')
+  return /UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|socket hang up|fetch failed/i.test(`${code ?? ''} ${message}`)
+}
+
+/**
+ * HTTP-level failures worth retrying. SignatureDoesNotMatch belongs here: when
+ * the request is tunnelled through a VPN, an intermediary can corrupt it in
+ * flight, and OSS then reports a signature mismatch for a request whose
+ * signature is identical to one that just succeeded. Retrying is harmless
+ * (the signature is either right or it is not) and turns a dead run into a
+ * recovered one. Terminal conditions such as InvalidAccessKeyId are excluded.
+ */
+export function isRetryableHttpFailure(status, code) {
+  if (status >= 500 || status === 429 || status === 408) return true
+  return /SignatureDoesNotMatch|RequestTimeTooSkewed|ServiceUnavailable|InternalError|OperationTimeout|RequestTimeout/i.test(String(code ?? ''))
+}
+
 export function createS3Backend({
   accessKeyId,
   accessKeySecret,
@@ -149,7 +173,8 @@ export function createS3Backend({
         return await fn(attempt)
       } catch (error) {
         lastError = error
-        if (!(error instanceof BackendError) || !error.retryable || attempt === retries) throw error
+        const retryable = (error instanceof BackendError && error.retryable) || isTransportFailure(error)
+        if (!retryable || attempt === retries) throw error
         await sleep(Math.min(30_000, 500 * 2 ** attempt))
       }
     }
@@ -167,14 +192,15 @@ export function createS3Backend({
     try {
       response = await fetchImpl(urlFor(path, query), { method, headers: signed.headers, signal: controller.signal })
     } catch (error) {
-      throw new BackendError(`${method} ${key || '/'} transport error: ${error.message}`, { operation: method, key, retryable: true, cause: error })
+      const cause = error?.cause ?? error
+      throw new BackendError(`${method} ${key || '/'} transport error: ${cause?.message ?? error.message}`, { operation: method, key, retryable: isTransportFailure(error), cause: error })
     } finally {
       clearTimeout(timer)
     }
     const text = expectBody ? await response.text() : ''
     if (!response.ok) {
-      const retryable = response.status >= 500 || response.status === 429 || response.status === 408
-      throw new BackendError(`${method} ${key || '/'} -> ${response.status} ${errorFromXml(text, response.statusText)}`, { operation: method, key, retryable })
+      const code = xmlText(text, 'Code')
+      throw new BackendError(`${method} ${key || '/'} -> ${response.status} ${errorFromXml(text, response.statusText)}`, { operation: method, key, retryable: isRetryableHttpFailure(response.status, code) })
     }
     return { response, text }
   }
@@ -245,13 +271,14 @@ export function createS3Backend({
           response = await fetchImpl(urlFor(path, {}), { method: 'PUT', headers: signed.headers, body: stream, duplex: 'half', signal: controller.signal })
         } catch (error) {
           stream.destroy()
-          throw new BackendError(`put ${key} transport error: ${error.message}`, { operation: 'put', key, retryable: true, cause: error })
+          const cause = error?.cause ?? error
+          throw new BackendError(`put ${key} transport error: ${cause?.message ?? error.message}`, { operation: 'put', key, retryable: isTransportFailure(error), cause: error })
         } finally {
           clearTimeout(timer)
         }
         if (!response.ok) {
           const text = await response.text().catch(() => '')
-          throw new BackendError(`put ${key} -> ${response.status} ${errorFromXml(text, response.statusText)}`, { operation: 'put', key, retryable: response.status >= 500 })
+          throw new BackendError(`put ${key} -> ${response.status} ${errorFromXml(text, response.statusText)}`, { operation: 'put', key, retryable: isRetryableHttpFailure(response.status, xmlText(text, 'Code')) })
         }
         return { key, size, digest }
       })
@@ -265,10 +292,10 @@ export function createS3Backend({
         const response = await fetchImpl(urlFor(path, {}), { method: 'PUT', headers: signed.headers })
         const text = await response.text().catch(() => '')
         if (!response.ok) {
-          throw new BackendError(`copy ${fromKey} -> ${toKey} -> ${response.status} ${errorFromXml(text, response.statusText)}`, { operation: 'copy', key: toKey, retryable: response.status >= 500 })
+          throw new BackendError(`copy ${fromKey} -> ${toKey} -> ${response.status} ${errorFromXml(text, response.statusText)}`, { operation: 'copy', key: toKey, retryable: isRetryableHttpFailure(response.status, xmlText(text, 'Code')) })
         }
         const code = xmlText(text, 'Code')
-        if (code) throw new BackendError(`copy ${fromKey} -> ${toKey} rejected: ${errorFromXml(text, code)}`, { operation: 'copy', key: toKey })
+        if (code) throw new BackendError(`copy ${fromKey} -> ${toKey} rejected: ${errorFromXml(text, code)}`, { operation: 'copy', key: toKey, retryable: isRetryableHttpFailure(200, code) })
       })
     },
 

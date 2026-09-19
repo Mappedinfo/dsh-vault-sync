@@ -242,3 +242,112 @@ test('concurrent runs are refused by the run lock', async () => {
     assert.equal(await first, 'first')
   } finally { await cleanup(h.root) }
 })
+
+test('a failed version archive warns but never leaves the current file unbacked-up', async () => {
+  // The archive protects history; the upload protects the current data. When the
+  // archive copy fails, losing one revision must not also lose the file itself.
+  const h = await harness('archivewarn')
+  try {
+    await writeFiles(h.library, { 'x.pdf': 'first' })
+    await h.engine.run({})
+    await writeFile(join(h.library, 'x.pdf'), 'second-different-length')
+
+    const realCopy = h.backend.copy.bind(h.backend)
+    const failingBackend = {
+      ...h.backend,
+      describe: h.backend.describe,
+      list: h.backend.list,
+      head: h.backend.head,
+      putFile: h.backend.putFile,
+      remove: h.backend.remove,
+      readText: h.backend.readText,
+      copy: async (from, to) => {
+        if (to.startsWith('versions/')) throw new Error('injected archive failure')
+        return realCopy(from, to)
+      },
+    }
+    const engine = createEngine({ config: h.config, backend: failingBackend, now: () => new Date('2026-03-04T01:02:03Z') })
+    const result = await engine.run({})
+    assert.equal(result.totals.upload, 1, 'the current content must still be uploaded')
+    assert.equal(result.totals.failed, 0, 'a lost archive is a warning, not a failed file')
+    assert.equal(result.totals.archiveWarnings, 1)
+    assert.equal(await failingBackend.readText('current/papers/x.pdf'), 'second-different-length')
+    assert.equal(result.perSource[0].archiveWarnings[0].versionKey, 'versions/2026-03-04/papers/x.pdf')
+  } finally { await cleanup(h.root) }
+})
+
+test('archiveFailure=fail keeps the strict behaviour when asked for it', async () => {
+  const h = await harness('archivefail')
+  try {
+    await writeFiles(h.library, { 'x.pdf': 'first' })
+    await h.engine.run({})
+    await writeFile(join(h.library, 'x.pdf'), 'second-different-length')
+    const realCopy = h.backend.copy.bind(h.backend)
+    const failingBackend = {
+      ...h.backend,
+      copy: async (from, to) => {
+        if (to.startsWith('versions/')) throw new Error('injected archive failure')
+        return realCopy(from, to)
+      },
+    }
+    const config = { ...h.config, remote: { ...h.config.remote, archiveFailure: 'fail' } }
+    const engine = createEngine({ config, backend: failingBackend, now: () => new Date('2026-03-04T01:02:03Z') })
+    const result = await engine.run({})
+    assert.equal(result.totals.failed, 1)
+    assert.equal(result.totals.archiveWarnings, 0)
+  } finally { await cleanup(h.root) }
+})
+
+test('a per-source allowRemoteDelete=false keeps history while another source still prunes', async () => {
+  // Append-only collection: a local move or delete must leave the historical
+  // remote copy in place. Another source in the same config keeps the global
+  // policy, so this is a per-source override, not a global switch.
+  const h = await harness('persource')
+  try {
+    await writeFiles(h.library, { 'keep.pdf': 'keep', 'gone.pdf': 'gone' })
+    await writeFiles(h.kg, { 'kg-gone.json': 'kg' })
+    const config = {
+      ...h.config,
+      remote: { ...h.config.remote, allowRemoteDelete: true },
+      sources: [
+        { ...h.config.sources[0], allowRemoteDelete: false },
+        { ...h.config.sources[1] },
+      ],
+    }
+    const engine = createEngine({ config, backend: h.backend, now: () => new Date('2026-03-04T01:02:03Z') })
+    await engine.run({})
+
+    // Remove one file from each source behind the engine's back.
+    await rm(join(h.library, 'gone.pdf'))
+    await rm(join(h.kg, 'kg-gone.json'))
+    const result = await engine.run({})
+
+    const papers = result.perSource.find(row => row.id === 'papers')
+    const kg = result.perSource.find(row => row.id === 'kg')
+    assert.equal(papers.deleted, 0, 'the append-only source must not delete')
+    assert.equal(kg.deleted, 1, 'the other source keeps the global policy')
+
+    // The append-only source keeps its history; the other source removes it.
+    assert.ok(await h.backend.head('current/papers/gone.pdf'), 'history must survive in the append-only source')
+    assert.equal(await h.backend.head('current/kg/kg-gone.json'), undefined)
+    assert.equal(await h.backend.readText('versions/2026-03-04/kg/kg-gone.json'), 'kg', 'the pruned source still archives first')
+  } finally { await cleanup(h.root) }
+})
+
+test('an append-only source reports a locally deleted file as kept, not as a failure', async () => {
+  const h = await harness('appendonly')
+  try {
+    await writeFiles(h.library, { 'gone.pdf': 'gone' })
+    const config = { ...h.config, sources: [{ ...h.config.sources[0], allowRemoteDelete: false }] }
+    const engine = createEngine({ config, backend: h.backend, now: () => new Date('2026-03-04T01:02:03Z') })
+    await engine.run({ only: ['papers'] })
+    await rm(join(h.library, 'gone.pdf'))
+    const plan = await engine.plan({ only: ['papers'] })
+    const kept = plan.entries.papers.items.filter(item => item.reason === 'local-deleted-keep-remote')
+    assert.equal(kept.length, 1)
+    assert.equal(plan.entries.papers.remoteDelete, false, 'the plan must report the effective policy')
+    const result = await engine.run({ only: ['papers'] })
+    assert.equal(result.totals.failed, 0)
+    assert.ok(await h.backend.head('current/papers/gone.pdf'))
+  } finally { await cleanup(h.root) }
+})
