@@ -17,6 +17,12 @@
 - **可核对**：`verify` 比较本地与远端，明确区分"摘要一致""仅大小一致""远端缺失"；无法用摘要核对时如实报出，不假装已校验。
 - **零常驻**：没有后台进程、没有全文索引、没有 PDF 解析。每次运行是一个短时 Node 进程，任务结束即退出。
 
+## 社区
+
+非官方项目，由社区成员独立开发与维护。在 DSH 插件专区的分享帖见 [discussions/2004 专区](https://github.com/deepseek-ai/deepseek-harness/discussions/2004)；帖子正文与截图源文件在 [docs/community/](docs/community/)。
+
+推送前请跑 `npm run check:publication`（含历史扫描），它会拦住云密钥、密钥赋值、绝对家目录路径、私有集合名与真实 OSS 地域。
+
 ## 安装
 
 Node `^22.19 || >=24`。本包无运行时依赖：

@@ -1,0 +1,13 @@
+{
+  "repository": "deepseek-ai/deepseek-harness",
+  "repositoryId": "R_kgDOT3T1gw",
+  "category": "Show Your Plugins!",
+  "categoryId": "DIC_kwDOT3T1g84DDSUe",
+  "guidelines": "https://github.com/deepseek-ai/deepseek-harness/discussions/2004",
+  "title": "DSH | Vault Sync | 把本地研究资料单向、可版本化地备份到阿里云 OSS",
+  "bodyFile": "docs/community/showcase.md",
+  "images": [
+    "docs/community/images/doctor.png",
+    "docs/community/images/versioning.png"
+  ]
+}

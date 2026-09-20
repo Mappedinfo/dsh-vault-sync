@@ -1,0 +1,58 @@
+**_> 非官方项目，由社区成员独立开发和维护。_**
+
+**项目地址：**
+https://github.com/Mappedinfo/dsh-vault-sync
+
+**项目介绍：**
+
+把本地研究资料**单向、可版本化**地备份到阿里云 OSS。
+
+研究资料有个尴尬处境：论文 PDF、Obsidian 笔记、实验产出全部散在本机若干目录里，而它们往往没有真正的第二份副本。网盘客户端做不到可控的单向覆盖，直接 `rsync`/`rclone` 又缺"被覆盖的旧版本去哪了"的答案。
+
+这个插件处理三件事：
+
+- **单向**。只从本地写向远端。远端变更不会回流，也不会覆盖本地资料。
+- **覆盖前先归档**。被改写或删除的远端对象先服务端复制到 `versions/<日期>/`，所以旧版本可追溯。
+- **只增不减（按源可选）**。某个集合设 `allowRemoteDelete: false` 后，文件被移动或删除时远端历史副本原地保留，并在报告里标为 `local-deleted-keep-remote`。
+
+**与 DSH 的集成方式：**
+
+它注册为 DSH 插件，挂载 6 个原生工具，由会话里的模型直接调用：
+
+| 工具 | 作用 |
+|:--|:--|
+| `vault_sync_status` | 引擎、源、索引规模、最近运行与**在跑运行的进度** |
+| `vault_sync_plan` | 只读规划：将上传 / 归档 / 删除 / 未改动 |
+| `vault_sync_run` | 执行单向备份（唯一需要确认的工具，可用 `dry_run` 预览） |
+| `vault_sync_verify` | 核对镜像，区分 `ok` / `okWithWarnings` / `mismatch` |
+| `vault_sync_restore` | 定位当前对象与各日期归档版本 |
+| `vault_sync_cost` | 按官方费率与自述假设估算年费用 |
+
+这 6 个工具都只是把 CLI 作为短时子进程运行并解析其 JSON 报告，主机不保留第二套引擎状态。除 `vault_sync_run` 需确认外都只读。
+
+配套还有一个内置技能 `vault-sync`，记录单向红线、标准流程与故障处理，供模型在会话中加载。
+
+**调度交给 dsh-cron-scheduler。** 本插件不own调度：把 `vault-sync run` 写成系统级 cron 任务，由 `dsh --profile headless` 在进程外执行，DSH Web 不必常开。
+
+**截图：**
+
+![doctor：运行前解析每个源的传输策略](https://github.com/Mappedinfo/dsh-vault-sync/blob/main/docs/community/images/doctor.png?raw=true)
+
+![覆盖前归档、只增不减源保留历史、核对三态](https://github.com/Mappedinfo/dsh-vault-sync/blob/main/docs/community/images/versioning.png?raw=true)
+
+截图来自随包 CLI 针对一个合成演示目录（本地文件系统镜像，无云账号）的真实输出。
+
+**设计上几个刻意的取舍：**
+
+- **不依赖 rclone**。内置 SigV4 S3 兼容客户端，用 AWS 公开的 `get-vanilla` 测试向量逐字节比对签名；rclone 通道保留为可选项。缺外部二进制时功能不该整体不可用。
+- **发布不走服务端复制**。默认直接 PUT 到正式键再校验；真实链路上一度出现 `CopyObject` 间歇性被中间设备破坏（403），而 PUT 稳定。
+- **归档失败不等同于文件失败**。历史版本是次要的，为保住一份历史副本而让当前数据没有备份是反的，所以归档失败只记警告。
+- **宁可少传，不可错删**。只有"大小变化"或"摘要不符"才替换远端对象；无法证明相同时留在原地并如实报告，不假装已核对。
+- **不下载任何东西**。`restore` 只报告远端 key，取回由你自己用 rclone / ossutil 完成。
+- **可观测性零网络**。进度写在独立瞬态文件里，`status` 与 `progress` 纯本地读取——列举远端是按对象数计费的。
+
+**边界（明确不做）：** 不做双向同步、不下载回流、不解析 PDF、不建全文索引、不自动去重、不代管 OSS 生命周期规则与解冻。
+
+**验证状态：** 120 项 JavaScript 测试与 4 项可复现校验通过，全部使用合成数据与本地/进程内替身，零真实云凭据、零网络请求。**尚未验证**：真实 OSS 桶往返、真实 rclone 二进制、在运行中的 DSH Web 进程内挂载。范围与逐条证据见 [docs/validation.md](https://github.com/Mappedinfo/dsh-vault-sync/blob/main/docs/validation.md)。
+
+**依赖与许可：** 无运行时依赖；原创代码 MIT。默认目标为阿里云 OSS；可选 rclone（MIT）由使用方自行安装，本仓库不打包也不启动它。
