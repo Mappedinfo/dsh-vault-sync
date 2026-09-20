@@ -9,6 +9,7 @@
  * several files at once and concurrent writers would otherwise each persist a
  * document missing the other's entry.
  */
+import { createReadStream, createWriteStream } from 'node:fs'
 import { copyFile, mkdir, readFile, rm, stat } from 'node:fs/promises'
 import { dirname, join, relative, sep } from 'node:path'
 import { assertSafeKey, BackendError } from '../core/backend.mjs'
@@ -122,6 +123,35 @@ export function createFilesystemBackend({ root }) {
 
     async readText(key) {
       return readFile(resolve(key), 'utf8')
+    },
+
+    /**
+     * Stream one object to localPath, reporting the digest of what was actually
+     * written so the caller can decide whether to keep it. The write is atomic:
+     * a partial file is never left in place of a good one.
+     */
+    async downloadFile(key, localPath, { onBytes } = {}) {
+      const source = resolve(key)
+      if (!(await pathExists(source))) throw new BackendError(`object missing: ${key}`, { operation: 'download', key })
+      await mkdir(dirname(localPath), { recursive: true })
+      const partial = `${localPath}.part-${process.pid}`
+      const expected = digestFor(await loadMeta(), key, (await stat(source)).size)
+      let written = 0
+      try {
+        const input = createReadStream(source)
+        const output = createWriteStream(partial)
+        for await (const chunk of input) {
+          written += chunk.length
+          onBytes?.(chunk.length)
+          if (!output.write(chunk)) await new Promise(resolveDrain => output.once('drain', resolveDrain))
+        }
+        await new Promise((resolveEnd, rejectEnd) => { output.end(error => (error ? rejectEnd(error) : resolveEnd())) })
+      } catch (error) {
+        await rm(partial, { force: true })
+        throw new BackendError(`download ${key} failed: ${error.message}`, { operation: 'download', key, retryable: true })
+      }
+      const digest = await sha256File(partial)
+      return { key, localPath: partial, size: written, digest, expectedDigest: expected }
     },
   }
 }

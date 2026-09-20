@@ -15,12 +15,14 @@ vault-sync <command> [options]
 | `status` | 引擎、源、索引规模、最近运行 | 0 |
 | `verify` | 与远端镜像核对 | 0 / 不符为 1 |
 | `cost` | 年费用算术估算 | 0 |
+| `recover` | 按镜像重建本地文件（新机器） | 0 / 1 |
 | `restore` | 定位当前对象与日期版本 | 0 |
 | `sources` | 列出配置的源 | 0 |
 
 公共选项：`--config <绝对路径>`、`--source <id>`（可重复）、`--json`、`--help`。`status` 也返回 `progress[]`（活动运行的本地进度，零网络）。`status` 另有 `--remote`：默认只读本地索引（零网络），该开关会额外列举远端前缀（计费，与对象数成正比）。
 `run` 另有 `--dry-run`（等价 `plan`）与 `--quiet`（仅打印一行摘要；`--json` 优先）。
 `verify` 另有 `--sample <n>`。`restore` 另有 `--stamp YYYY-MM-DD`。
+`recover` 需要 `--to <dir>`，另有 `--dry-run`、`--force-target`（允许非空目标）、`--on-archived fail|skip`。
 `cost` 另有 `--full-downloads <n>`、`--sporadic-gb <n>`、`--sporadic-objects <n>`、`--storage-class standard|infrequent|archive`、`--egress busy|idle`。
 
 `--json` 输出是稳定契约；人类可读输出仅为便利，不保证逐字稳定。

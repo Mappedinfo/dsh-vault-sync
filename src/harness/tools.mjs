@@ -53,6 +53,20 @@ export const TOOL_SPECS = [
     required: ['source', 'path'],
   },
   {
+    name: 'vault_sync_recover',
+    title: 'Rebuild local files from the backup',
+    description: 'Download the mirrored copy and rebuild real files under a target directory, for a new machine or a lost folder. Nothing at the target is ever deleted; each file is verified against its recorded digest and only then put in place, so an interrupted or corrupt download leaves nothing behind. A non-empty target is refused unless explicitly allowed. Files already present with a matching digest are skipped. Objects in an archived storage class cannot be read until OSS thaws them, and the tool reports that rather than returning a partial tree as complete.',
+    parameters: {
+      to: text('Destination directory, absolute or relative to the current workspace'),
+      source: optionalSources,
+      dry_run: { type: 'boolean', description: 'Report what would be downloaded and write nothing' },
+      allow_existing_target: { type: 'boolean', description: 'Merge into a non-empty directory; nothing is deleted, but this must be deliberate' },
+      on_archived: { type: 'string', enum: ['fail', 'skip'], description: 'fail (default) stops on an unreadable archived object; skip records it and continues' },
+    },
+    required: ['to'],
+    mutate: true,
+  },
+  {
     name: 'vault_sync_cost',
     title: 'Estimate annual cost',
     description: 'Estimate annual archived-storage, egress and request cost from the mirrored size using configured rates. An arithmetic estimate from a price table, not a bill and not a measurement.',
@@ -78,6 +92,15 @@ export function argsForTool(name, parameters = {}) {
       return ['verify', ...sourceArgs, ...(Number.isSafeInteger(parameters.sample) ? ['--sample', String(parameters.sample)] : [])]
     case 'vault_sync_restore':
       return ['restore', ...sourceArgs, String(parameters.source ?? ''), String(parameters.path ?? ''), ...(parameters.stamp ? ['--stamp', String(parameters.stamp)] : [])]
+    case 'vault_sync_recover':
+      return [
+        'recover',
+        '--to', String(parameters.to ?? ''),
+        ...sourceArgs,
+        ...(parameters.dry_run ? ['--dry-run'] : []),
+        ...(parameters.allow_existing_target ? ['--force-target'] : []),
+        ...(parameters.on_archived ? ['--on-archived', String(parameters.on_archived)] : []),
+      ]
     case 'vault_sync_cost':
       return ['cost', ...(Number.isSafeInteger(parameters.full_downloads) ? ['--full-downloads', String(parameters.full_downloads)] : []), ...(Number.isFinite(parameters.sporadic_gb) ? ['--sporadic-gb', String(parameters.sporadic_gb)] : []), ...(parameters.egress ? ['--egress', String(parameters.egress)] : [])]
     default:
@@ -97,6 +120,8 @@ export function summarizeToolResult(name, report) {
       return report.totals ? `uploaded ${report.totals.upload}, versioned ${report.totals.version}, deleted ${report.totals.delete}, failed ${report.totals.failed}` : undefined
     case 'vault_sync_verify':
       return `${report.checked ?? 0} checked, ok=${report.ok}`
+    case 'vault_sync_recover':
+      return report.totals ? `downloaded ${report.totals.downloaded}, skipped ${report.totals.skipped}, archived ${report.totals.archived}, failed ${report.totals.failed}` : undefined
     case 'vault_sync_cost':
       return `about ${report.totalPerYear} ${report.currency ?? ''}/year`
     default:
@@ -114,7 +139,9 @@ export function registerVaultSyncTools(ctx, defineTool, options) {
         if (decision.kind !== 'allow' || !mutating.has(exec.name)) return decision
         return {
           kind: 'ask',
-          reason: 'Upload local research data to the configured cloud remote and archive replaced versions. This is a one-way operation; the remote is never read back into the library.',
+          reason: exec.name === 'vault_sync_recover'
+            ? 'Download the mirrored backup and write real files under the target directory. Nothing is deleted, but this writes to disk outside the managed state.'
+            : 'Upload local research data to the configured cloud remote and archive replaced versions. This is a one-way operation; the remote is never read back into the local files.',
         }
       }))
     }

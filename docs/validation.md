@@ -7,7 +7,7 @@ npm test              # node --test tests/*.test.mjs
 node scripts/validate.mjs
 ```
 
-## 1. 自动化测试：120 项通过
+## 1. 自动化测试：130 项通过
 
 | 文件 | 项数 | 覆盖 |
 |:--|--:|:--|
@@ -21,8 +21,8 @@ node scripts/validate.mjs
 | `tests/cost.test.mjs` | 9 | 设计场景按二进制 GB 与 2026 价格页复算（存储 13.92、流出 43.00、取回 6.19）；标准存储 5 GiB 免费额度；标准→低频在免费额度内反而更贵；三档单位价格序 standard > infrequent > archive；闲时单价减半；归档/低频 64 KiB 最小计费而标准按实际大小；最低存储时长被写入假设；单位与币种分开声明；零对象与假设声明 |
 
 ```
-ℹ tests 120
-ℹ pass 120
+ℹ tests 130
+ℹ pass 130
 ℹ fail 0
 ```
 

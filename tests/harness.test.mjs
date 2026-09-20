@@ -28,7 +28,7 @@ function stubContext() {
 const defineTool = spec => spec
 
 test('every tool declares a description, parameters and an output renderer', () => {
-  assert.equal(TOOL_SPECS.length, 6)
+  assert.equal(TOOL_SPECS.length, 7)
   for (const spec of TOOL_SPECS) {
     assert.ok(spec.name.startsWith('vault_sync_'), spec.name)
     assert.ok(spec.description.length > 60, `${spec.name} needs a real description`)
@@ -43,33 +43,43 @@ test('tool calls map to CLI argv without any secret field', () => {
   assert.deepEqual(argsForTool('vault_sync_run', { dry_run: true }), ['plan'])
   assert.deepEqual(argsForTool('vault_sync_verify', { sample: 25 }), ['verify', '--sample', '25'])
   assert.deepEqual(argsForTool('vault_sync_restore', { source: 'papers', path: 'a.pdf' }), ['restore', 'papers', 'a.pdf'])
+  assert.deepEqual(argsForTool('vault_sync_recover', { to: '/tmp/out' }), ['recover', '--to', '/tmp/out'])
+  assert.deepEqual(argsForTool('vault_sync_recover', { to: '/tmp/out', dry_run: true, on_archived: 'skip' }), ['recover', '--to', '/tmp/out', '--dry-run', '--on-archived', 'skip'])
   assert.deepEqual(argsForTool('vault_sync_cost', { egress: 'idle' }), ['cost', '--egress', 'idle'])
   assert.throws(() => argsForTool('nope', {}), /unknown vault-sync tool/)
 })
 
-test('only the upload tool is treated as mutating and gated for approval', async () => {
+test('the two tools that write are gated for approval and the readers are not', async () => {
   const ctx = stubContext()
   registerVaultSyncTools(ctx, defineTool, { requireToolApproval: true, configPath: undefined })
-  assert.equal(ctx.registered.length, 6)
+  assert.equal(ctx.registered.length, 7)
   const gate = ctx.hooks.find(hook => hook.event === 'tools/pre-execute')
   assert.ok(gate, 'an approval hook should be registered')
   const nextAllow = async () => ({ kind: 'allow' })
   assert.equal((await gate.handler({ name: 'vault_sync_plan' }, nextAllow)).kind, 'allow')
-  const decision = await gate.handler({ name: 'vault_sync_run' }, nextAllow)
-  assert.equal(decision.kind, 'ask')
-  assert.match(decision.reason, /one-way/)
+  // run uploads to the remote; recover writes real files to disk. Both change
+  // something outside the tool call, so both are gated.
+  for (const name of ['vault_sync_run', 'vault_sync_recover']) {
+    const decision = await gate.handler({ name }, nextAllow)
+    assert.equal(decision.kind, 'ask', `${name} must be gated`)
+  }
+  const runDecision = await gate.handler({ name: 'vault_sync_run' }, nextAllow)
+  assert.match(runDecision.reason, /one-way/)
+  const recoverDecision = await gate.handler({ name: 'vault_sync_recover' }, nextAllow)
+  assert.match(recoverDecision.reason, /target|download|rebuild/i)
 })
 
 test('approval can be disabled without changing the registered tools', () => {
   const ctx = stubContext()
   registerVaultSyncTools(ctx, defineTool, { requireToolApproval: false })
   assert.equal(ctx.hooks.filter(hook => hook.event === 'tools/pre-execute').length, 0)
-  assert.equal(ctx.registered.length, 6)
+  assert.equal(ctx.registered.length, 7)
 })
 
 test('results are summarized in one line for the reader', () => {
   assert.match(summarizeToolResult('vault_sync_plan', { totals: { upload: 3, version: 1, delete: 0, unchanged: 9 } }), /upload 3/)
   assert.match(summarizeToolResult('vault_sync_verify', { checked: 40, ok: false }), /ok=false/)
+  assert.match(summarizeToolResult('vault_sync_recover', { totals: { downloaded: 3, skipped: 1, archived: 0, failed: 0 } }), /downloaded 3/)
   assert.match(summarizeToolResult('vault_sync_cost', { totalPerYear: 65.16, currency: 'CNY' }), /65.16 CNY/)
   assert.equal(summarizeToolResult('vault_sync_status', { sources: [{ id: 'papers', indexed: 2, remoteObjects: 2 }] }), 'papers: 2 indexed / 2 remote')
 })

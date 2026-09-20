@@ -5,7 +5,9 @@
  * PutObject, CopyObject, DeleteObject, GetObject.
  */
 import { createHash, createHmac } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { mkdir, rm } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { BackendError } from '../core/backend.mjs'
 
 export const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
@@ -306,6 +308,73 @@ export function createS3Backend({
     async readText(key) {
       const { text } = await withRetry('get', key, () => bodyRequest({ method: 'GET', key }))
       return text
+    },
+
+    /**
+     * Stream one object to localPath.
+     *
+     * An object in archive, cold-archive or deep-cold-archive storage cannot be
+     * read at all until OSS has thawed it, and OSS answers such a GET with 403
+     * InvalidObjectState. That is not a transient failure and not an access
+     * problem, so it is surfaced as its own error kind: retrying it forever, or
+     * reporting it as "permission denied", would both mislead.
+     *
+     * The write is atomic: bytes land in a sibling partial file and the caller
+     * decides whether to keep them, so an interrupted download never replaces a
+     * good local file.
+     */
+    async downloadFile(key, localPath, { onBytes, expectedDigest } = {}) {
+      const path = pathFor(key)
+      const signed = authorize({ method: 'GET', path, headers: { host: host() }, payloadHash: EMPTY_SHA256 })
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000)
+      let response
+      try {
+        response = await fetchImpl(urlFor(path, {}), { method: 'GET', headers: signed.headers, signal: controller.signal })
+      } catch (error) {
+        const cause = error?.cause ?? error
+        throw new BackendError(`get ${key} transport error: ${cause?.message ?? error.message}`, { operation: 'download', key, retryable: isTransportFailure(error), cause: error })
+      } finally {
+        clearTimeout(timer)
+      }
+      if (!response.ok) {
+        const text = await response.text().catch(() => '')
+        const code = xmlText(text, 'Code')
+        const message = `${response.status} ${errorFromXml(text, response.statusText)}`
+        if (code === 'InvalidObjectState') {
+          const archived = new BackendError(`object ${key} is in an archived storage class and must be thawed (RestoreObject) before it can be read`, { operation: 'download', key, retryable: false })
+          archived.kind = 'archived'
+          throw archived
+        }
+        throw new BackendError(`get ${key} -> ${message}`, { operation: 'download', key, retryable: isRetryableHttpFailure(response.status, code) })
+      }
+      await mkdir(dirname(localPath), { recursive: true })
+      const partial = `${localPath}.part-${process.pid}`
+      const hash = createHash('sha256')
+      let written = 0
+      try {
+        const output = createWriteStream(partial)
+        for await (const chunk of response.body) {
+          hash.update(chunk)
+          written += chunk.length
+          onBytes?.(chunk.length)
+          if (!output.write(chunk)) await new Promise(resolveDrain => output.once('drain', resolveDrain))
+        }
+        await new Promise((resolveEnd, rejectEnd) => { output.end(error => (error ? rejectEnd(error) : resolveEnd())) })
+      } catch (error) {
+        await rm(partial, { force: true })
+        throw new BackendError(`download ${key} failed while writing: ${error.message}`, { operation: 'download', key, retryable: true })
+      }
+      const digest = hash.digest('hex')
+      if (expectedDigest && digest !== expectedDigest) {
+        // The bytes on the wire do not match what the mirror recorded. Keep them
+        // out of the way so the caller can report a corrupt download.
+        await rm(partial, { force: true })
+        const mismatch = new BackendError(`downloaded ${key} has digest ${digest}, expected ${expectedDigest}`, { operation: 'download', key })
+        mismatch.kind = 'digest-mismatch'
+        throw mismatch
+      }
+      return { key, localPath: partial, size: written, digest, expectedDigest }
     },
   }
 }

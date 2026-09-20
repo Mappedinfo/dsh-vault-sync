@@ -10,7 +10,7 @@ import { effectiveSourceSettings } from './core/config.mjs'
 import { readProgress } from './core/progress.mjs'
 import { formatBytes, pathExists } from './core/util.mjs'
 import { DEFAULT_RATES, GiB, estimateCosts } from './core/pricing.mjs'
-import { jsonReport, planReport, progressReport, runReport, statusReport, verifyReport } from './report.mjs'
+import { jsonReport, planReport, progressReport, recoverReport, runReport, statusReport, verifyReport } from './report.mjs'
 
 const USAGE = `vault-sync — one-way versioned backup of local research data to Aliyun OSS
 
@@ -25,6 +25,7 @@ Commands
   progress             live progress of a running backup (local only, no network)
   verify               compare local content with the remote mirror
   cost                 estimate annual OSS storage, egress and request cost
+  recover              rebuild local data from the mirror (new machine)
   restore              locate a current object or a dated archived version
   sources              list configured sources
 
@@ -48,6 +49,12 @@ cost options
   --sporadic-gb <n>         partial-retrieval egress per year in GB (default 6)
   --sporadic-objects <n>    partial retrievals per year (default 3000)
   --egress <busy|idle>      egress rate window (default busy)
+
+recover options
+  --to <dir>           destination directory (required)
+  --dry-run            show what would be downloaded, write nothing
+  --force-target       allow a non-empty destination (nothing is ever deleted)
+  --on-archived <how>  fail (default) | skip: what to do about archived objects
 
 restore options
   --stamp <YYYY-MM-DD> pin a dated version
@@ -81,6 +88,9 @@ function parseArgs(argv) {
     else if (arg === '--egress') options.egressWindow = argv[++i]
     else if (arg === '--storage-class') options.storageClass = argv[++i]
     else if (arg === '--progress-interval') options.progressIntervalMs = Number(argv[++i])
+    else if (arg === '--to') options.to = argv[++i]
+    else if (arg === '--force-target') options.forceTarget = true
+    else if (arg === '--on-archived') options.onArchived = argv[++i]
     else if (arg === '--remote') options.remote = true
     else if (arg === '--help' || arg === '-h') options.help = true
     else if (arg.startsWith('-')) throw new Error(`unknown option ${arg}`)
@@ -315,6 +325,31 @@ function makeSink(options) {
   }
 }
 
+async function commandRecover(options) {
+  if (!options.to) throw new Error('recover needs --to <directory>')
+  if (options.onArchived && !['fail', 'skip'].includes(options.onArchived)) throw new Error('--on-archived must be fail or skip')
+  const { engine } = await loadEngine(options)
+  const sink = item => {
+    if (item.status === 'archived') process.stderr.write(`  ARCHIVED ${item.sourceId ?? ''}/${item.relPath}: ${item.error}\n`)
+    else if (item.status !== 'downloaded') process.stderr.write(`  ${String(item.status).toUpperCase()} ${item.relPath}: ${item.error ?? ''}\n`)
+  }
+  if (options.dryRun) {
+    const { engine: planner } = await loadEngine(options)
+    const planned = await planner.recoverPlan({ only: options.source, to: options.to, allowExistingTarget: options.forceTarget === true })
+    print(options.json ? planned : recoverReport(planned, { dryRun: true }), options)
+    return 0
+  }
+  const result = await engine.recover({
+    only: options.source,
+    to: options.to,
+    allowExistingTarget: options.forceTarget === true,
+    onArchived: options.onArchived ?? 'fail',
+    sink,
+  })
+  print(options.json ? result : recoverReport(result, { dryRun: false }), options)
+  return result.ok ? 0 : 1
+}
+
 async function commandProgress(options) {
   const config = await readConfig(options.config ?? defaultConfigPath())
   const rows = await readProgress(config.stateDir)
@@ -418,6 +453,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'run': return commandRun(options)
     case 'status': return commandStatus(options)
     case 'progress': return commandProgress(options)
+    case 'recover': return commandRecover(options)
     case 'verify': return commandVerify(options)
     case 'cost': return commandCost(options)
     case 'restore': return commandRestore(options)

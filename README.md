@@ -199,7 +199,31 @@ vault-sync status            # 也包含活动运行的进度行
 
 ## 恢复
 
-本插件**不会**自行下载覆盖本地。`restore` 只报告位置：
+## 数据恢复（新机器）
+
+`restore` 只报告位置，不下载：
+
+```sh
+node src/cli.mjs restore paper-library 2024/paper.pdf
+node src/cli.mjs restore paper-library 2024/paper.pdf --stamp 2026-03-04
+```
+
+要在新机器上把镜像重建成真实文件，用 `recover`：
+
+```sh
+node src/cli.mjs recover --to /path/on/new/machine --dry-run   # 先看会下什么，不写盘
+node src/cli.mjs recover --to /path/on/new/machine             # 真正重建
+```
+
+目标目录下会按 `<源前缀>/<相对路径>` 还原，与镜像结构一致。规则：
+
+- **从不删除目标里已有的文件**，只补齐与替换；非空目录默认拒绝，合并要显式 `--force-target`。
+- 每个文件先写到 `.part` 临时名，**按摘要校验通过后才改名落位**；中断或校验失败不会在目标留下半份文件。
+- 已存在且摘要一致的文件直接跳过，所以可以反复重跑续传。
+- **归档/冷归档对象无法直接读取**（OSS 需先解冻）。默认因此明确失败并给出解冻指引，而不是产出一棵看似完整的半成品树；`--on-archived skip` 可改为记录并跳过。
+- 退出码：0 完整、1 不完整（有失败/损坏/归档）。
+
+原 `restore` 的用法（报告远端 key）仍然保留：
 
 ```sh
 node src/cli.mjs restore paper-library 2024/paper.pdf
@@ -246,7 +270,7 @@ cron 表达式按系统时区解释，不承诺秒级精度。
 ## 验证
 
 ```sh
-npm test                      # 120 项 JavaScript 测试，仅用合成数据与本地/进程内替身
+npm test                      # 130 项 JavaScript 测试，仅用合成数据与本地/进程内替身
 ```
 
 测试覆盖：SigV4 与 AWS 公开测试向量逐字节比对、配置与凭据规则、规划决策表、首次上传/幂等重跑/覆盖归档/本地删除归档/中断续传/临时对象清理/核对/版本定位/锁互斥、进程内 S3 兼容服务端到端（签名、分页、服务端复制、重试、错误映射）、rclone argv 构造与超时、Harness 工具映射与审批门、费用算术。详见 [验证记录](docs/validation.md)。

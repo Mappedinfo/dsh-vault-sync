@@ -3,12 +3,15 @@ import { createFilesystemBackend } from '../backends/filesystem.mjs'
 import { createRcloneBackend } from '../backends/rclone.mjs'
 import { createS3Backend } from '../backends/s3.mjs'
 import { assertBackend, createLayout } from './backend.mjs'
+import { readdir } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { effectiveSourceSettings } from './config.mjs'
 import { resolveCredentials } from './credentials.mjs'
 import { createJournal } from './journal.mjs'
 import { indexFromManifest, scanSource } from './manifest.mjs'
 import { createApplier } from './applier.mjs'
 import { createProgressTracker, pruneProgress, readProgress } from './progress.mjs'
+import { DEFAULT_RECOVER_CONCURRENCY, applyRecover, planRecoverSource } from './recover.mjs'
 import { nextIndex, planSource, sampleEvenly, summarizePlan } from './planner.mjs'
 import { formatBytes, newRunId, versionStamp } from './util.mjs'
 
@@ -593,6 +596,116 @@ export function createEngine({
     return totals
   }
 
+  /**
+   * Rebuild local data from the mirror, for a new machine or a lost directory.
+   *
+   * Deliberately conservative: nothing is deleted at the target, an existing
+   * file is only replaced when the mirror's digest says it differs, and each
+   * download is verified before it is renamed into place. Because a target can
+   * hold the only remaining copy of something, the caller has to opt in to
+   * merging into a directory that already has content.
+   */
+  /** Read-only view of what recover would write. Writes nothing, anywhere. */
+  async function recoverPlan({ only, to, allowExistingTarget = false } = {}) {
+    if (typeof to !== 'string' || !to.trim()) throw new Error('recover needs a destination directory (--to)')
+    const target = resolve(to)
+    const sources = selectSources(only)
+    if (!allowExistingTarget) {
+      let existing = []
+      try { existing = await readdir(target) } catch { existing = [] }
+      if (existing.length > 0) {
+        throw new Error(`${target} is not empty (${existing.length} entries); pass --force-target only if merging is intended`)
+      }
+    }
+    const plan = []
+    for (const source of sources) {
+      const listing = await backendFor(source).list(layout.currentPrefix(source.remote))
+      plan.push({ source, ...(await planRecoverSource({ source, layout, listing, target })) })
+    }
+    const sum = key => plan.reduce((total, row) => total + row.stats[key], 0)
+    return {
+      target,
+      dryRun: true,
+      sources: plan.map(row => ({ id: row.source.id, remote: row.source.remote, ...row.stats })),
+      unsafe: plan.flatMap(row => row.unsafe.map(entry => ({ id: row.source.id, ...entry }))),
+      totals: { remote: sum('remote'), download: sum('download'), skip: sum('skip'), unsafe: sum('unsafe'), bytes: sum('bytes') },
+    }
+  }
+
+  async function recover({
+    only,
+    to,
+    allowExistingTarget = false,
+    onArchived = 'fail',
+    concurrency = DEFAULT_RECOVER_CONCURRENCY,
+    sink,
+    onProgress,
+    control = {},
+  } = {}) {
+    if (typeof to !== 'string' || !to.trim()) throw new Error('recover needs a destination directory (--to)')
+    const target = resolve(to)
+    const shouldStop = typeof control.shouldStop === 'function' ? control.shouldStop : () => false
+    const sources = selectSources(only)
+
+    if (!allowExistingTarget) {
+      let existing = []
+      try { existing = await readdir(target) } catch { existing = [] }
+      if (existing.length > 0) {
+        throw new Error(`${target} is not empty (${existing.length} entries); recover merges without deleting anything, so pass allowExistingTarget (--force-target) only if that is intended`)
+      }
+    }
+
+    const plan = []
+    for (const source of sources) {
+      const listing = await backendFor(source).list(layout.currentPrefix(source.remote))
+      plan.push({ source, ...(await planRecoverSource({ source, layout, listing, target })) })
+    }
+    const sum = key => plan.reduce((total, row) => total + row.stats[key], 0)
+    const planReport = {
+      target,
+      sources: plan.map(row => ({ id: row.source.id, remote: row.source.remote, ...row.stats })),
+      unsafe: plan.flatMap(row => row.unsafe.map(entry => ({ id: row.source.id, ...entry }))),
+      totals: { remote: sum('remote'), download: sum('download'), skip: sum('skip'), unsafe: sum('unsafe'), bytes: sum('bytes') },
+    }
+
+    const summaries = []
+    for (const row of plan) {
+      const settings = settingsFor(row.source)
+      const bound = settings.concurrency === 'auto' ? concurrency : Math.min(concurrency, settings.concurrency ?? concurrency)
+      const outcome = await applyRecover(row.source, row.items, {
+        backend: backendFor(row.source),
+        target,
+        sink,
+        shouldStop,
+        concurrency: bound,
+        onArchived,
+      })
+      summaries.push(outcome.summary)
+      onProgress?.({ source: row.source, ...outcome.summary })
+      if (outcome.summary.stopped) break
+    }
+    const add = key => summaries.reduce((total, row) => total + row[key], 0)
+    const bytes = add('bytes')
+    const totals = {
+      planned: planReport.totals.download,
+      downloaded: add('downloaded'),
+      skipped: add('skipped'),
+      archived: add('archived'),
+      corrupt: add('corrupt'),
+      failed: add('failed'),
+      bytes,
+      bytesHuman: formatBytes(bytes),
+      stopped: summaries.some(row => row.stopped),
+    }
+    return {
+      target,
+      plan: planReport,
+      sources: summaries,
+      totals,
+      ok: totals.failed === 0 && totals.corrupt === 0 && totals.archived === 0,
+    }
+  }
+
   return {
     config,
     backend,
@@ -605,6 +718,8 @@ export function createEngine({
     run,
     verify,
     restore,
+    recover,
+    recoverPlan,
     status,
     totalStats,
     writeIndex: (id, entries) => journal.writeIndex(id, entries),

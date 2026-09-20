@@ -125,6 +125,49 @@ export function progressReport(rows) {
   return out
 }
 
+export function recoverReport(result, { dryRun = false } = {}) {
+  if (dryRun) {
+    let out = `vault-sync recover (dry run) → ${result.target}\n`
+    out += `  to download ${result.totals.download} files (${formatBytes(result.totals.bytes)}), ${result.totals.skip} already present, ${result.totals.remote} on the remote\n\n`
+    out += table(result.sources, [
+      { header: 'source', value: row => row.id },
+      { header: 'remote', value: row => row.remote },
+      { header: 'remote-objects', value: row => row.remote },
+      { header: 'download', value: row => row.download },
+      { header: 'present', value: row => row.skip },
+      { header: 'bytes', value: row => formatBytes(row.bytes) },
+    ])
+    if (result.unsafe.length > 0) {
+      out += '\n  refused (would not be written):\n'
+      for (const entry of result.unsafe.slice(0, 20)) out += `  ! ${entry.id}: ${entry.key} (${entry.reason})\n`
+    }
+    return out
+  }
+  let out = `vault-sync recover → ${result.target}\n`
+  out += `  downloaded ${result.totals.downloaded}/${result.totals.planned} files (${result.totals.bytesHuman})\n`
+  out += `  already present ${result.totals.skipped}\n`
+  if (result.totals.archived) out += `  archived, needs thawing ${result.totals.archived}\n`
+  if (result.totals.corrupt) out += `  corrupt ${result.totals.corrupt}\n`
+  out += `  failed ${result.totals.failed}\n`
+  if (result.totals.stopped) out += '  stopped early on request; re-run to continue\n'
+  out += `  result ${result.ok ? 'complete' : 'INCOMPLETE'}\n\n`
+  out += table(result.sources, [
+    { header: 'source', value: row => row.id },
+    { header: 'planned', value: row => row.planned },
+    { header: 'downloaded', value: row => row.downloaded },
+    { header: 'present', value: row => row.skipped },
+    { header: 'archived', value: row => row.archived },
+    { header: 'corrupt', value: row => row.corrupt },
+    { header: 'failed', value: row => row.failed },
+    { header: 'bytes', value: row => formatBytes(row.bytes) },
+  ])
+  if (result.totals.archived) {
+    out += '\n  An archived object cannot be read until OSS thaws it. Thaw it, then re-run:\n'
+    out += '    ossutil restore oss://<bucket>/<key>\n'
+  }
+  return out
+}
+
 export function statusReport(result) {
   let out = 'vault-sync status\n'
   out += `  engine   ${result.engine?.kind} (${result.engine?.detail})\n`
