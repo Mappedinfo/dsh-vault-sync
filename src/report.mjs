@@ -87,6 +87,28 @@ export function verifyReport(result) {
   return out
 }
 
+export function progressReport(rows) {
+  if (rows.length === 0) return 'vault-sync progress: no run in progress (no progress files)\n'
+  let out = 'vault-sync progress\n'
+  for (const row of rows) {
+    const totals = row.totals ?? {}
+    const percent = totals.planned > 0 ? ((totals.done / totals.planned) * 100).toFixed(1) : 'unknown'
+    out += `  ${row.runId}  ${row.status}${row.stale ? ' (stale: no live run lock)' : ''}\n`
+    out += `    ${totals.done ?? 0}/${totals.planned ?? 0} files (${percent}%)  ${totals.bytesHuman ?? ''}`
+    if (row.ratePerSec) out += `  ${row.ratePerSec} files/s`
+    if (row.etaSeconds) out += `  ETA ${Math.round(row.etaSeconds / 60)}m`
+    out += '\n'
+    out += `    failed ${totals.failed ?? 0} | started ${row.startedAt} | updated ${row.updatedAt ?? '-'}\n`
+    for (const source of row.sources ?? []) {
+      out += `      ${source.id}: ${source.done}/${source.scanned}`
+      if (source.failed) out += ` (${source.failed} failed)`
+      if (source.currentFile) out += `  current ${source.currentFile}`
+      out += '\n'
+    }
+  }
+  return out
+}
+
 export function statusReport(result) {
   let out = 'vault-sync status\n'
   out += `  engine   ${result.engine?.kind} (${result.engine?.detail})\n`
@@ -99,6 +121,17 @@ export function statusReport(result) {
     ...(result.remoteListed ? [{ header: 'remote-objects', value: row => row.remoteObjects ?? 0 }] : []),
     { header: 'last-index', value: row => row.lastIndexedAt ?? '' },
   ])
+  if ((result.progress ?? []).length > 0) {
+    out += '\n  in progress\n'
+    out += table(result.progress, [
+      { header: 'run', value: row => row.runId },
+      { header: 'status', value: row => `${row.status}${row.stale ? ' (stale)' : ''}` },
+      { header: 'files', value: row => `${row.totals?.done ?? 0}/${row.totals?.planned ?? 0}` },
+      { header: 'failed', value: row => row.totals?.failed ?? 0 },
+      { header: 'rate', value: row => (row.ratePerSec ? `${row.ratePerSec}/s` : '') },
+      { header: 'current', value: row => row.sources?.find(s => s.currentFile)?.currentFile ?? '' },
+    ])
+  }
   if (result.runs.length > 0) {
     out += '\n  recent runs\n'
     out += table(result.runs, [

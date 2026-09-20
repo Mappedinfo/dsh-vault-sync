@@ -7,9 +7,10 @@ import { configTemplate, defaultConfigPath, readConfig, writeConfig } from './co
 import { ENV_FILE_NAME, envFileModeReport, resolveCredentials } from './core/credentials.mjs'
 import { createBackends, createEngine } from './core/engine.mjs'
 import { effectiveSourceSettings } from './core/config.mjs'
+import { readProgress } from './core/progress.mjs'
 import { formatBytes, pathExists } from './core/util.mjs'
 import { DEFAULT_RATES, GiB, estimateCosts } from './core/pricing.mjs'
-import { jsonReport, planReport, runReport, statusReport, verifyReport } from './report.mjs'
+import { jsonReport, planReport, progressReport, runReport, statusReport, verifyReport } from './report.mjs'
 
 const USAGE = `vault-sync — one-way versioned backup of local research data to Aliyun OSS
 
@@ -20,7 +21,8 @@ Commands
   doctor               check config, sources, transport and credentials
   plan                 show what a run would upload, version and delete
   run                  execute the backup (idempotent, resumable, one-way)
-  status               local index, remote object counts and recent runs
+  status               local index, remote object counts, live progress and recent runs
+  progress             live progress of a running backup (local only, no network)
   verify               compare local content with the remote mirror
   cost                 estimate annual OSS storage, egress and request cost
   restore              locate a current object or a dated archived version
@@ -52,6 +54,12 @@ restore options
 
 status options
   --remote             also list the remote prefixes (billed, proportional to object count)
+
+progress options
+  --run <id>           only this run (default: every progress file)
+
+run options (progress)
+  --progress           print a machine-readable progress line periodically
 `
 
 function parseArgs(argv) {
@@ -224,6 +232,14 @@ async function commandRun(options) {
   return result.totals.failed > 0 ? 1 : 0
 }
 
+async function commandProgress(options) {
+  const config = await readConfig(options.config ?? defaultConfigPath())
+  const rows = await readProgress(config.stateDir)
+  const selected = options.run ? rows.filter(row => row.runId === options.run) : rows
+  print(options.json ? selected : progressReport(selected), options)
+  return 0
+}
+
 async function commandStatus(options) {
   const { engine } = await loadEngine(options)
   // Local by default: listing the remote is billed and proportional to size.
@@ -317,6 +333,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'plan': return commandPlan(options)
     case 'run': return commandRun(options)
     case 'status': return commandStatus(options)
+    case 'progress': return commandProgress(options)
     case 'verify': return commandVerify(options)
     case 'cost': return commandCost(options)
     case 'restore': return commandRestore(options)

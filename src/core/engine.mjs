@@ -8,6 +8,7 @@ import { resolveCredentials } from './credentials.mjs'
 import { createJournal } from './journal.mjs'
 import { indexFromManifest, scanSource } from './manifest.mjs'
 import { createApplier } from './applier.mjs'
+import { createProgressTracker, pruneProgress, readProgress } from './progress.mjs'
 import { nextIndex, planSource, sampleEvenly, summarizePlan } from './planner.mjs'
 import { formatBytes, newRunId, versionStamp } from './util.mjs'
 
@@ -200,28 +201,45 @@ export function createEngine({
     const entries = {}
     let tempKeys = 0
     for (const { source, scan } of scanned) {
-      const prefix = layout.currentPrefix(source.remote)
-      const listing = await backendFor(source).list(prefix)
-      tempKeys += listing.filter(entry => entry.key.startsWith(`${layout.tempRoot}/`)).length
-      const previous = (await journal.readIndex(source.id)).entries ?? {}
-      const settings = settingsFor(source)
-      const result = planSource({
-        files: scan.files,
-        remote: listing,
-        layout,
-        remoteName: source.remote,
-        previous,
-        stamp: stamp ?? versionStamp(now()),
-        allowRemoteDelete: settings.allowRemoteDelete,
-      })
-      entries[source.id] = {
-        source,
-        scan,
-        listing,
-        previous,
-        settings,
-        remoteDelete: settings.allowRemoteDelete,
-        ...result,
+      // One source must not take the round down with it. A source can fail on its
+      // own transport (an unreachable endpoint, an expired credential, a listing
+      // that keeps timing out) while the others are perfectly healthy, and the
+      // healthy ones should still be backed up. The failure is recorded on the
+      // source so it is impossible to miss in the report.
+      try {
+        const prefix = layout.currentPrefix(source.remote)
+        const listing = await backendFor(source).list(prefix)
+        tempKeys += listing.filter(entry => entry.key.startsWith(`${layout.tempRoot}/`)).length
+        const previous = (await journal.readIndex(source.id)).entries ?? {}
+        const settings = settingsFor(source)
+        const result = planSource({
+          files: scan.files,
+          remote: listing,
+          layout,
+          remoteName: source.remote,
+          previous,
+          stamp: stamp ?? versionStamp(now()),
+          allowRemoteDelete: settings.allowRemoteDelete,
+        })
+        entries[source.id] = {
+          source,
+          scan,
+          listing,
+          previous,
+          settings,
+          remoteDelete: settings.allowRemoteDelete,
+          ...result,
+        }
+      } catch (error) {
+        entries[source.id] = {
+          source,
+          scan,
+          settings: settingsFor(source),
+          remoteDelete: settingsFor(source).allowRemoteDelete,
+          items: [],
+          stats: { local: scan.files.length, remoteListed: 0, upload: 0, version: 0, delete: 0, skip: 0, unchanged: 0, remoteOnly: 0, unchangedUnverified: 0, bytesToUpload: 0 },
+          error: error instanceof Error ? error.message : String(error),
+        }
       }
     }
     const summary = summarizePlan(Object.values(entries).map(entry => ({
@@ -233,7 +251,7 @@ export function createEngine({
       stats: entry.stats,
     }))).map((row, index) => {
       const entry = Object.values(entries)[index]
-      return { ...row, remoteDelete: entry.remoteDelete, effective: entry.settings }
+      return { ...row, remoteDelete: entry.remoteDelete, effective: entry.settings, ...(entry.error ? { error: entry.error } : {}) }
     })
     return { entries, summary, totals: totalStats(summary), tempKeys }
   }
@@ -255,6 +273,12 @@ export function createEngine({
       if (dryRun) return { runId, dryRun: true, plan: planned, record: runRecord }
 
       const runPath = await journal.beginRun(runRecord)
+      await pruneProgress(config.stateDir)
+      const tracker = createProgressTracker({ stateDir: config.stateDir, runId, now: () => now().getTime() })
+      // The planned count is only known after each source is scanned.
+      for (const entry of Object.values(planned.entries)) {
+        await tracker.sourceScanned(entry.source.id, entry.scan.files.length)
+      }
       const applier = createApplier({
         backend,
         backendForSource: backendFor,
@@ -280,6 +304,23 @@ export function createEngine({
         for (const entry of Object.values(planned.entries)) {
           const source = entry.source
           const scan = entry.scan
+          // Planning failed for this source, so there is nothing to apply. Its
+          // health is reported through perSource[].error below.
+          if (entry.error) {
+            perSource.push({
+              id: source.id,
+              remote: source.remote,
+              root: source.root,
+              scanned: scan.files.length,
+              skippedLocal: scan.skipped,
+              uploaded: 0, versioned: 0, deleted: 0, unchanged: 0, bytesUploaded: 0,
+              failed: [],
+              archiveWarnings: [],
+              error: entry.error,
+            })
+            await journal.updateRun(runId, { sources: perSource, tempPruned: tempPruned.length })
+            continue
+          }
           const filePaths = new Map(scan.files.map(file => [file.relPath, file.path]))
           // Persist the digest index as work completes, not only at the end of a
           // source. A run that dies at 99% (a hung proxy, a lost link, a reboot)
@@ -293,6 +334,12 @@ export function createEngine({
           // so a flattened copy without the overrides would silently fall back to
           // the remote defaults.
           const results = await applier.applySource({ ...source, filePaths }, entry.items, {
+            onItem: item => {
+              // Every finished file advances progress, including failures: the
+              // point of the file is to answer "how far has this got", and a run
+              // stuck retrying one object must be visible as such.
+              void tracker.fileDone({ sourceId: source.id, relPath: item.relPath, status: item.status, bytes: item.size })
+            },
             onGroup: (group, groupResults) => {
               const relPath = group[0]?.relPath
               if (!relPath) return
@@ -320,14 +367,20 @@ export function createEngine({
             bytesUploaded: applied.filter(item => item.action === 'upload').reduce((sum, item) => sum + (item.size ?? 0), 0),
             failed: failed.map(item => ({ relPath: item.relPath, action: item.action, error: item.error, retryable: item.retryable })),
             archiveWarnings: results.filter(item => item.status === 'warning').map(item => ({ relPath: item.relPath, versionKey: item.versionKey, warning: item.warning })),
+            ...(entry.error ? { error: entry.error } : {}),
           })
           // The index advances only for a source whose work fully succeeded, so a
-          // partial run never claims a failed file is already backed up.
-          if (failed.length === 0) await journal.writeIndex(source.id, nextIndex(scan.files))
+          // partial run never claims a failed file is already backed up. A source
+          // whose planning failed is recorded with its error and its index is left
+          // alone, so the next run retries it from a known state.
+          if (failed.length === 0 && !entry.error) await journal.writeIndex(source.id, nextIndex(scan.files))
           await journal.updateRun(runId, { sources: perSource, tempPruned: tempPruned.length })
         }
         const totals = totalStats(perSource)
         const prunedRuns = await journal.pruneRuns()
+        // A source that failed to plan counts as a failed item so the round is
+        // reported as partial rather than as a clean success.
+        totals.failed += perSource.filter(row => row.error).length
         await journal.updateRun(runId, {
           status: totals.failed > 0 ? 'partial' : 'ok',
           finishedAt: new Date().toISOString(),
@@ -335,9 +388,13 @@ export function createEngine({
           tempPruned: tempPruned.length,
           prunedRuns,
         })
-        return { runId, stamp, runPath, engine: firstBackend().describe(), tempPruned, perSource, totals, record: await journal.readRun(runId) }
+        await tracker.finish(totals.failed > 0 ? 'partial' : 'finished')
+        return { runId, stamp, runPath, progressPath: tracker.path, engine: firstBackend().describe(), tempPruned, perSource, totals, record: await journal.readRun(runId) }
       } catch (error) {
         await journal.updateRun(runId, { status: 'failed', finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) })
+        // Keep the progress file on failure: this is exactly when a reader needs
+        // to know how far the run got and which file it was on.
+        await tracker.finish('failed').catch(() => {})
         throw error
       }
     })
@@ -460,7 +517,10 @@ export function createEngine({
       }
       return row
     }))
-    return { engine: firstBackend().describe(), stateDir: config.stateDir, remoteListed: remote, sources, runs: recent }
+    // Progress is read from disk, so a caller can watch a long run without
+    // touching the remote: a listing is billed and proportional to object count.
+    const progress = await readProgress(config.stateDir)
+    return { engine: firstBackend().describe(), stateDir: config.stateDir, remoteListed: remote, sources, runs: recent, progress }
   }
 
   function totalStats(list) {
@@ -485,6 +545,7 @@ export function createEngine({
     config,
     backend,
     layout,
+    progress: () => readProgress(config.stateDir),
     journal,
     plan,
     run,

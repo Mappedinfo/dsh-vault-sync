@@ -228,3 +228,50 @@ test('createBackends prepares one transport per policy and reports the engine on
     await cleanup(root)
   }
 })
+
+test('a source that fails to plan does not abort the sources that are healthy', async () => {
+  const root = await tempDir('vault-iso-')
+  try {
+    const broken = join(root, 'broken')
+    const healthy = join(root, 'healthy')
+    await writeFiles(broken, { 'b.txt': 'b' })
+    await writeFiles(healthy, { 'h.txt': 'h' })
+    const config = normalizeConfig(filesystemConfig({
+      stateDir: join(root, 'state'),
+      remoteRoot: join(root, 'remote'),
+      sources: [
+        { id: 'broken', root: broken, remote: 'broken', timeoutSeconds: 30 },
+        { id: 'healthy', root: healthy, remote: 'healthy', timeoutSeconds: 30 },
+      ],
+    }))
+    const withRule = () => {
+      const backend = createFilesystemBackend({ root: join(root, 'remote') })
+      return {
+        ...backend,
+        describe: backend.describe,
+        // Only the broken source's prefix listing fails, the way an unreachable
+        // endpoint or an expired credential behaves for one collection.
+        list: async prefix => {
+          if (String(prefix).includes('/broken')) throw new Error('injected listing failure')
+          return backend.list(prefix)
+        },
+      }
+    }
+    const engine = createEngine({ config, backendFactory: withRule, now: () => new Date('2026-06-01T00:00:00Z') })
+    const result = await engine.run({})
+
+    const brokenRow = result.perSource.find(row => row.id === 'broken')
+    const healthyRow = result.perSource.find(row => row.id === 'healthy')
+    assert.match(brokenRow.error, /injected listing failure/)
+    assert.equal(brokenRow.uploaded, 0)
+    assert.equal(healthyRow.uploaded, 1, 'the healthy source must still be backed up')
+    assert.equal(result.totals.failed, 1, 'the failed source is counted so the round is partial')
+    assert.equal(result.record.status, 'partial')
+    // The failed source keeps its old index, so the next run retries from a known
+    // state instead of believing the file is backed up.
+    const planned = await engine.plan({})
+    assert.match(planned.entries.broken.error, /injected listing failure/)
+  } finally {
+    await cleanup(root)
+  }
+})
