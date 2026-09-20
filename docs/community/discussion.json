@@ -1,0 +1,16 @@
+{
+  "author": "wsqstar",
+  "discussion": {
+    "id": "D_kwDOT3T1g84ApZaY",
+    "number": 7283,
+    "url": "https://github.com/deepseek-ai/deepseek-harness/discussions/7283"
+  },
+  "title": "DSH | Vault Sync | 把本地研究资料单向、可版本化地备份到阿里云 OSS",
+  "category": "Show Your Plugins!",
+  "bodySha256": "d874a8368682cfb191c3ceb3ca3aa4baffe57eccefe401f4eac85027217a2e4c",
+  "images": [
+    "docs/community/images/doctor.png",
+    "docs/community/images/versioning.png"
+  ],
+  "publishedAt": "2026-09-20T11:55:24.854Z"
+}
