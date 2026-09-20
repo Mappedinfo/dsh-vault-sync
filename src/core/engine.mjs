@@ -372,24 +372,51 @@ export function createEngine({
           // The index advances only for a source whose work fully succeeded, so a
           // partial run never claims a failed file is already backed up. A source
           // whose planning failed is recorded with its error and its index is left
-          // alone, so the next run retries it from a known state.
-          if (failed.length === 0 && !entry.error) await journal.writeIndex(source.id, nextIndex(scan.files))
+          // alone, so the next run retries it from a known state. A stopped run is
+          // the same case: the files it never reached were not uploaded, so
+          // advancing to the full scan would claim work that did not happen.
+          const stoppedHere = applier.stopped
+          if (failed.length === 0 && !entry.error && !stoppedHere) await journal.writeIndex(source.id, nextIndex(scan.files))
           await journal.updateRun(runId, { sources: perSource, tempPruned: tempPruned.length })
+          if (applier.stopped) {
+            // Stop scheduling new sources too: the point of a graceful stop is to
+            // land a consistent record, not to keep spending the link.
+            const remaining = Object.values(planned.entries).filter(item => !perSource.some(row => row.id === item.source.id))
+            for (const item of remaining) {
+              perSource.push({
+                id: item.source.id,
+                remote: item.source.remote,
+                root: item.source.root,
+                scanned: item.scan.files.length,
+                skippedLocal: item.scan.skipped,
+                uploaded: 0, versioned: 0, deleted: 0, unchanged: 0, bytesUploaded: 0,
+                failed: [],
+                archiveWarnings: [],
+                pending: true,
+              })
+            }
+            break
+          }
         }
         const totals = totalStats(perSource)
         const prunedRuns = await journal.pruneRuns()
         // A source that failed to plan counts as a failed item so the round is
         // reported as partial rather than as a clean success.
         totals.failed += perSource.filter(row => row.error).length
+        totals.pending = perSource.filter(row => row.pending).length
+        // A requested stop outranks a partial result: "interrupted" tells a reader
+        // the round was cut short on purpose, not that something went wrong.
+        const interrupted = applier.stopped || shouldStop()
+        totals.interrupted = interrupted
         await journal.updateRun(runId, {
-          status: totals.failed > 0 ? 'partial' : 'ok',
+          status: interrupted ? 'interrupted' : (totals.failed > 0 ? 'partial' : 'ok'),
           finishedAt: new Date().toISOString(),
           totals,
           tempPruned: tempPruned.length,
           prunedRuns,
         })
-        await tracker.finish(totals.failed > 0 ? 'partial' : 'finished')
-        return { runId, stamp, runPath, progressPath: tracker.path, engine: firstBackend().describe(), tempPruned, perSource, totals, record: await journal.readRun(runId) }
+        await tracker.finish(interrupted ? 'interrupted' : (totals.failed > 0 ? 'partial' : 'finished'))
+        return { runId, stamp, runPath, progressPath: tracker.path, interrupted, engine: firstBackend().describe(), tempPruned, perSource, totals, record: await journal.readRun(runId) }
       } catch (error) {
         await journal.updateRun(runId, { status: 'failed', finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) })
         // Keep the progress file on failure: this is exactly when a reader needs

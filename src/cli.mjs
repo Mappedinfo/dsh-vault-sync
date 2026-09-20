@@ -218,18 +218,70 @@ async function commandPlan(options) {
 async function commandRun(options) {
   const { engine } = await loadEngine(options)
   const started = Date.now()
-  const sink = options.quiet || process.env.VAULT_SYNC_PROGRESS === '0' ? undefined : item => {
-    if (item.status === 'applied') process.stderr.write(`  ${item.action} ${item.sourceId}/${item.relPath}\n`)
+  const stop = { requested: false }
+  let signalsSeen = 0
+  const onSignal = signal => {
+    signalsSeen += 1
+    if (signalsSeen === 1) {
+      // Stop claiming new files and land a consistent record. The files already
+      // in flight are allowed to finish: aborting one mid-transfer is how a
+      // partial object gets published.
+      stop.requested = true
+      process.stderr.write(`\nvault-sync: ${signal} received, stopping after the files in flight; progress will be saved (send again to exit immediately)\n`)
+      return
+    }
+    process.stderr.write('\nvault-sync: second signal, exiting without saving\n')
+    process.exit(130)
   }
-  const result = await engine.run({ only: options.source, dryRun: options.dryRun, sink })
+  const handlers = [
+    ['SIGINT', () => onSignal('SIGINT')],
+    ['SIGTERM', () => onSignal('SIGTERM')],
+  ]
+  for (const [signal, handler] of handlers) process.on(signal, handler)
+  let result
+  try {
+    result = await engine.run({
+      only: options.source,
+      dryRun: options.dryRun,
+      sink: makeSink(options),
+      control: { shouldStop: () => stop.requested },
+    })
+  } finally {
+    for (const [signal, handler] of handlers) process.removeListener(signal, handler)
+  }
   // --json always wins: the quiet one-liner is a human convenience only.
   if (options.quiet && !options.json) {
     const seconds = Math.round((Date.now() - started) / 1000)
-    process.stdout.write(`vault-sync run ${result.runId}: uploaded=${result.totals.upload} versioned=${result.totals.version} deleted=${result.totals.delete} failed=${result.totals.failed} in ${seconds}s\n`)
+    const state = result.interrupted ? ' interrupted' : ''
+    process.stdout.write(`vault-sync run ${result.runId}:${state} uploaded=${result.totals.upload} versioned=${result.totals.version} deleted=${result.totals.delete} failed=${result.totals.failed} in ${seconds}s\n`)
+    if (result.progressPath && result.interrupted) process.stdout.write(`progress kept at ${result.progressPath}\n`)
   } else {
     print(options.json ? result : runReport(result), options)
   }
+  if (result.interrupted) return 130
   return result.totals.failed > 0 ? 1 : 0
+}
+
+/**
+ * Where per-file lines go. Failures and archive warnings are printed the moment
+ * they happen, even under --quiet: losing 65 uploads to a timeout that only
+ * appeared in the end-of-run report is exactly what made a real failure look
+ * like a silent, stalled run.
+ */
+function makeSink(options) {
+  const muted = process.env.VAULT_SYNC_PROGRESS === '0'
+  return item => {
+    if (item.status === 'failed') {
+      process.stderr.write(`  FAILED ${item.action} ${item.sourceId}/${item.relPath}: ${item.error}${item.retryable ? ' (retryable)' : ''}\n`)
+      return
+    }
+    if (item.status === 'warning') {
+      process.stderr.write(`  WARN ${item.action} ${item.sourceId}/${item.relPath}: ${item.warning}\n`)
+      return
+    }
+    if (muted || options.quiet) return
+    if (item.status === 'applied') process.stderr.write(`  ${item.action} ${item.sourceId}/${item.relPath}\n`)
+  }
 }
 
 async function commandProgress(options) {

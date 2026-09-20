@@ -27,6 +27,7 @@ export function createApplier({
   onProgress = () => {},
 } = {}) {
   const failures = []
+  let stoppedByRequest = false
   const transportFor = source => (backendForSource ? backendForSource(source) : backend)
   const settingsOf = source => (settingsForSource ? settingsForSource(source) : { concurrency, archiveFailure })
 
@@ -126,7 +127,7 @@ export function createApplier({
       // Checked before claiming a group, never inside one: a file's own
       // archive-then-publish order must run to completion.
       if (stopped) return []
-      if (shouldStop()) { stopped = true; return [] }
+      if (shouldStop()) { stopped = true; stoppedByRequest = true; return [] }
       const results = []
       for (const item of group) {
         const enriched = { ...item, sourceId: source.id, remoteName: source.remote, localPath: item.localPath ?? source.filePaths?.get(item.relPath) }
@@ -147,6 +148,7 @@ export function createApplier({
       return results
     })
     const flat = perGroup.flat()
+    if (stopped) stoppedByRequest = true
     onProgress({ source, settings, planned: groups.length, completed: flat.length, stopped })
     return flat
   }
@@ -166,5 +168,12 @@ export function createApplier({
     return pruned
   }
 
-  return { applyItem, applySource, pruneTempKeys, failures }
+  return {
+    applyItem,
+    applySource,
+    pruneTempKeys,
+    failures,
+    /** True once a stop was requested and observed between groups. */
+    get stopped() { return stoppedByRequest },
+  }
 }
