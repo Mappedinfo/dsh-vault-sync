@@ -7,7 +7,7 @@ npm test              # node --test tests/*.test.mjs
 node scripts/validate.mjs
 ```
 
-## 1. 自动化测试：80 项通过
+## 1. 自动化测试：120 项通过
 
 | 文件 | 项数 | 覆盖 |
 |:--|--:|:--|
@@ -21,19 +21,37 @@ node scripts/validate.mjs
 | `tests/cost.test.mjs` | 9 | 设计场景按二进制 GB 与 2026 价格页复算（存储 13.92、流出 43.00、取回 6.19）；标准存储 5 GiB 免费额度；标准→低频在免费额度内反而更贵；三档单位价格序 standard > infrequent > archive；闲时单价减半；归档/低频 64 KiB 最小计费而标准按实际大小；最低存储时长被写入假设；单位与币种分开声明；零对象与假设声明 |
 
 ```
-ℹ tests 80
-ℹ pass 80
+ℹ tests 120
+ℹ pass 120
 ℹ fail 0
 ```
 
+
+### 本轮新增的测试文件（针对真实故障）
+
+| 文件 | 覆盖 |
+|:--|:--|
+| `tests/transport.test.mjs` | 按源传输策略：无覆盖时共用同一实例、不同策略各建一个、按源并发真正生效、覆盖却无工厂时构造期报错、plan 报告有效策略、createBackends 组装、**单源失败不中断整轮** |
+| `tests/progress.test.mjs` | 小于落盘阈值的源仍有进度、记录当前文件与失败计数、节流不按文件写、完成即删/中断保留、陈旧标记、写失败不影响运行、清理、速率与 ETA、status 零网络可见进度 |
+| `tests/signals.test.mjs` | 真实子进程发 SIGTERM：退出码 130、运行记录 `interrupted`、进度落盘保留、锁释放、**索引不前移到完整扫描**、二次信号立即退出、未受信号的运行干净结束 |
+
+### 本轮被测试抓住的缺陷（新增）
+
+15. **引擎向 applier 传了拆平的 source**（只含 id/remote/filePaths），导致按源参数被静默忽略、全部回落到全局默认值——按源并发测试直接观测到峰值是 16 而不是 2。
+16. **优雅停止时索引仍推进到完整扫描**，把从未上传的文件记成已备份；这是"不得声称未发生的工作"的又一例。
+17. **计划失败的源丢失了错误信息**，一轮可能看起来完整而实际上有一个集合没被碰过。
+18. **`cost` 仍引用已移除的单 backend**，其失败在验证脚本学会"点名出错的命令"之前完全不可见（原先只报 `Unexpected end of JSON input`）。
+19. **测试夹具构造了不完整的 `remote`**，使 `publishStrategy`/`archiveFailure` 为 `undefined`，测试与真实配置不一致——夹具改为从随包模板派生。
+
 ## 2. 可复现端到端：`node scripts/validate.mjs`
 
-3 项检查全部通过（合成目录 + 一次性本地远端）：
+4 项检查全部通过（合成目录 + 一次性本地远端）：
 
 ```
-vault-sync validation: PASS (3 checks)
-  ok   tests: 8 test files passed (80 cases)
+vault-sync validation: PASS (4 checks)
+  ok   tests: 11 test files passed
   ok   round-trip: 3 uploads, idempotent re-run, 1 modification archived, 1 deletion archived, verify ok, 3 runs recorded
+  ok   progress-visibility: a source smaller than any flush threshold is still visible while it runs
   ok   harness-contract: 6 tools and the bundled skill load without the Harness runtime
 ```
 

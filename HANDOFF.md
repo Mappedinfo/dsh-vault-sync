@@ -23,6 +23,7 @@
 | `src/core/applier.mjs` | 执行：归档 → 临时上传 → 校验 → 发布；临时键回收 |
 | `src/core/engine.mjs` | 组装 plan/run/verify/restore/status；传输选择 |
 | `src/core/pricing.mjs` | 费率与费用算术 |
+| `src/core/progress.mjs` | 运行中进度：独立瞬态文件、节流、陈旧判定、清理 |
 | `src/backends/filesystem.mjs` | 本地镜像传输（语义等价，测试基准） |
 | `src/backends/s3.mjs` | SigV4 与 S3 兼容 REST（OSS 路径） |
 | `src/backends/rclone.mjs` | rclone 通道（argv、超时、重试） |
@@ -49,6 +50,7 @@
 | 高 | 真实 rclone 通道 | 在有 rclone 的机器上验证 `lsjson --stat` 输出、退出码与超时；确认 `size-match-unverified` 的实际比例 |
 | 中 | Harness 运行时挂载 | 在真实 DSH Web profile 注册并让模型调用一次 `vault_sync_plan`；验证 `requireToolApproval` 的审批气泡 |
 | 中 | cron 任务落地 | 用 dsh-cron-scheduler 建一条周任务，确认 headless 会话里能读到 JSON 报告 |
+| 中 | 断点续传的细粒度 | 目前以对象为最小续传单位（已由优雅停止与增量进度覆盖大部分痛点） |
 | 中 | 版本区保留清理 | 目前依赖 OSS 生命周期规则；可选实现 `versions` 侧按天清理（需要远端列举与删除，注意幂等） |
 | 中 | 跨源并发 | `sources` 目前串行；`remote.concurrency` 已校验但未用于并行上传。若启用，必须保持"同源串行、归档先于覆盖" |
 | 低 | 大库容量测量 | 1 万对象 / 40 GB 的扫描时间与常驻内存未测；清单当前全量驻内存 |
