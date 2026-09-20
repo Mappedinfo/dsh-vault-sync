@@ -3,6 +3,7 @@ import { createFilesystemBackend } from '../backends/filesystem.mjs'
 import { createRcloneBackend } from '../backends/rclone.mjs'
 import { createS3Backend } from '../backends/s3.mjs'
 import { assertBackend, createLayout } from './backend.mjs'
+import { effectiveSourceSettings } from './config.mjs'
 import { resolveCredentials } from './credentials.mjs'
 import { createJournal } from './journal.mjs'
 import { indexFromManifest, scanSource } from './manifest.mjs'
@@ -63,9 +64,113 @@ export async function createBackend(config, { credentials, env = process.env } =
   }
 }
 
-export function createEngine({ config, backend, journal = createJournal({ stateDir: config.stateDir, localRuns: config.localRuns }), now = () => new Date(), onProgress } = {}) {
-  assertBackend(backend)
+/**
+ * Build one transport per distinct transfer policy, plus a factory the engine
+ * uses lazily for any policy it meets later. Sources that do not override
+ * timeoutSeconds or retries all resolve to the same policy and therefore share
+ * a single instance, so a deployment with no overrides still creates exactly one
+ * transport.
+ */
+export async function createBackends(config, { credentials, env = process.env } = {}) {
+  const resolved = credentials ?? await resolveCredentials({
+    configDir: config.credentialsFile ? undefined : config.stateDir,
+    filePath: config.credentialsFile,
+    env,
+  })
+  const created = new Map()
+  const build = async settings => {
+    const remote = { ...config.remote, timeoutSeconds: settings.timeoutSeconds, retries: settings.retries }
+    const { backend, engine, notes } = await createBackend({ ...config, remote }, { credentials: resolved, env })
+    return { backend, engine, notes }
+  }
+  const bySource = new Map()
+  const notes = new Set()
+  let engineKind
+  for (const source of config.sources) {
+    const settings = effectiveSourceSettings(source, config.remote)
+    const key = `${settings.timeoutSeconds}:${settings.retries}`
+    if (!created.has(key)) created.set(key, await build(settings))
+    const built = created.get(key)
+    bySource.set(source.id, built.backend)
+    for (const note of built.notes ?? []) notes.add(note)
+    engineKind ??= built.engine
+  }
+  return {
+    backends: bySource,
+    backendFactory: settings => {
+      // The factory is synchronous by contract; reuse an already built policy or
+      // build it once more for a policy the eager pass did not see.
+      const key = `${settings.timeoutSeconds}:${settings.retries}`
+      if (created.has(key)) return created.get(key).backend
+      throw new Error(`transport policy ${key} was not prepared; build it eagerly with createBackends`)
+    },
+    engine: engineKind,
+    notes: [...notes],
+  }
+}
+
+export function createEngine({
+  config,
+  backend,
+  backends,
+  backendFactory,
+  journal = createJournal({ stateDir: config.stateDir, localRuns: config.localRuns }),
+  now = () => new Date(),
+  onProgress,
+} = {}) {
+  const settingsFor = source => effectiveSourceSettings(source, config.remote)
   const layout = createLayout(config.remote)
+
+  // A transport only carries its timeout and retry budget; the key layout, the
+  // credentials and the endpoint are identical for every source. So a deployment
+  // with no per-source overrides resolves every source to the same policy and
+  // therefore to the very same instance, and behaves exactly as it did before
+  // per-source transports existed. A source that promises large files can raise
+  // its own timeout without affecting the small-file sources in the same run.
+  const shared = backend
+  if (shared) assertBackend(shared)
+  const cache = new Map()
+  // A source inherits the shared transport unless it explicitly overrides one of
+  // the two settings a transport is built from. Deciding that from the source's
+  // own fields (rather than from resolved equality) keeps the rule easy to state
+  // and impossible to get wrong when two sources happen to share values.
+  const overridesTransport = source => source.timeoutSeconds !== undefined || source.retries !== undefined
+  if (!backendFactory && !backends) {
+    // Nothing can build a second transport, so a source's timeout or retry
+    // override cannot be honoured. Refuse up front rather than silently falling
+    // back to the shared instance, which would hide a misconfiguration behind a
+    // slow or failing run.
+    const overriding = config.sources.filter(overridesTransport)
+    if (overriding.length > 0) {
+      throw new Error(`sources ${overriding.map(source => source.id).join(', ')} override timeoutSeconds/retries but no backendFactory was supplied; pass backends or a backendFactory so each source gets its own transport`)
+    }
+    if (shared) for (const source of config.sources) cache.set(source.id, shared)
+  } else if (backends) {
+    for (const [sourceId, instance] of backends) {
+      const source = config.sources.find(entry => entry.id === sourceId)
+      if (!source) continue
+      assertBackend(instance)
+      cache.set(source.id, instance)
+    }
+  } else if (shared) {
+    for (const source of config.sources) if (!overridesTransport(source)) cache.set(source.id, shared)
+  }
+
+  const backendFor = source => {
+    const cached = cache.get(source.id)
+    if (cached) return cached
+    if (!backendFactory) throw new Error(`source ${source.id} overrides timeoutSeconds/retries but no backend factory was supplied`)
+    const created = backendFactory(settingsFor(source))
+    assertBackend(created)
+    cache.set(source.id, created)
+    return created
+  }
+
+  const firstBackend = () => {
+    if (config.sources.length > 0) return backendFor(config.sources[0])
+    if (shared) return shared
+    throw new Error('no sources are configured, so there is no transport to use')
+  }
 
   const selectSources = only => {
     if (!only || only.length === 0) return config.sources
@@ -96,9 +201,10 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
     let tempKeys = 0
     for (const { source, scan } of scanned) {
       const prefix = layout.currentPrefix(source.remote)
-      const listing = await backend.list(prefix)
+      const listing = await backendFor(source).list(prefix)
       tempKeys += listing.filter(entry => entry.key.startsWith(`${layout.tempRoot}/`)).length
       const previous = (await journal.readIndex(source.id)).entries ?? {}
+      const settings = settingsFor(source)
       const result = planSource({
         files: scan.files,
         remote: listing,
@@ -106,14 +212,15 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
         remoteName: source.remote,
         previous,
         stamp: stamp ?? versionStamp(now()),
-        allowRemoteDelete: source.allowRemoteDelete ?? config.remote.allowRemoteDelete,
+        allowRemoteDelete: settings.allowRemoteDelete,
       })
       entries[source.id] = {
         source,
         scan,
         listing,
         previous,
-        remoteDelete: source.allowRemoteDelete ?? config.remote.allowRemoteDelete,
+        settings,
+        remoteDelete: settings.allowRemoteDelete,
         ...result,
       }
     }
@@ -124,27 +231,42 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
       files: entry.scan.files,
       skipped: entry.scan.skipped,
       stats: entry.stats,
-    }))).map((row, index) => ({ ...row, remoteDelete: Object.values(entries)[index].remoteDelete }))
+    }))).map((row, index) => {
+      const entry = Object.values(entries)[index]
+      return { ...row, remoteDelete: entry.remoteDelete, effective: entry.settings }
+    })
     return { entries, summary, totals: totalStats(summary), tempKeys }
   }
 
-  async function run({ only, dryRun = false, sink } = {}) {
+  async function run({ only, dryRun = false, sink, control = {} } = {}) {
     const stamp = versionStamp(now())
     const runId = newRunId(now())
+    const shouldStop = typeof control.shouldStop === 'function' ? control.shouldStop : () => false
     return journal.lock(async () => {
       const planned = await plan({ only, stamp })
       const runRecord = {
         runId,
         stamp,
         dryRun,
-        engine: backend.describe?.().kind,
+        engine: firstBackend()?.describe?.().kind,
         startedAt: new Date().toISOString(),
         sources: planned.summary,
       }
       if (dryRun) return { runId, dryRun: true, plan: planned, record: runRecord }
 
       const runPath = await journal.beginRun(runRecord)
-      const applier = createApplier({ backend, layout, runId, sink, publishStrategy: config.remote.publishStrategy, concurrency: config.remote.concurrency, archiveFailure: config.remote.archiveFailure })
+      const applier = createApplier({
+        backend,
+        backendForSource: backendFor,
+        settingsForSource: settingsFor,
+        layout,
+        runId,
+        sink,
+        publishStrategy: config.remote.publishStrategy,
+        concurrency: config.remote.concurrency,
+        archiveFailure: config.remote.archiveFailure,
+        shouldStop,
+      })
       const perSource = []
       let tempPruned = []
       try {
@@ -153,8 +275,8 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
         // that prefix instead of listing the whole bucket, which matters when the
         // bucket holds tens of thousands of objects.
         let tempListing = []
-        try { tempListing = await backend.list(layout.tempRoot) } catch { tempListing = [] }
-        tempPruned = await applier.pruneTempKeys(tempListing)
+        try { tempListing = await firstBackend().list(layout.tempRoot) } catch { tempListing = [] }
+        tempPruned = await applier.pruneTempKeys(tempListing, firstBackend())
         for (const entry of Object.values(planned.entries)) {
           const source = entry.source
           const scan = entry.scan
@@ -166,7 +288,11 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
           // map, so a partially finished run still records durable progress.
           const indexEntries = {}
           const completed = new Set()
-          const results = await applier.applySource({ id: source.id, remote: source.remote, filePaths }, entry.items, {
+          // The configured source travels through with its own fields intact:
+          // the applier resolves this source's effective transfer policy from it,
+          // so a flattened copy without the overrides would silently fall back to
+          // the remote defaults.
+          const results = await applier.applySource({ ...source, filePaths }, entry.items, {
             onGroup: (group, groupResults) => {
               const relPath = group[0]?.relPath
               if (!relPath) return
@@ -209,7 +335,7 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
           tempPruned: tempPruned.length,
           prunedRuns,
         })
-        return { runId, stamp, runPath, engine: backend.describe(), tempPruned, perSource, totals, record: await journal.readRun(runId) }
+        return { runId, stamp, runPath, engine: firstBackend().describe(), tempPruned, perSource, totals, record: await journal.readRun(runId) }
       } catch (error) {
         await journal.updateRun(runId, { status: 'failed', finishedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) })
         throw error
@@ -224,7 +350,8 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
     let checked = 0
     for (const source of sources) {
       const prefix = `${layout.currentPrefix(source.remote)}/`
-      const listing = await backend.list(prefix)
+      const transport = backendFor(source)
+      const listing = await transport.list(prefix)
       const remoteByPath = new Map()
       for (const entry of listing) if (entry.key.startsWith(prefix)) remoteByPath.set(entry.key.slice(prefix.length), entry)
       const index = (await journal.readIndex(source.id)).entries ?? {}
@@ -243,7 +370,7 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
         // before reporting a file as unverifiable.
         let digest = entry.digest
         if (!digest) {
-          try { digest = (await backend.head(entry.key))?.digest } catch { digest = undefined }
+          try { digest = (await transport.head(entry.key))?.digest } catch { digest = undefined }
         }
         if (digest) {
           if (digest !== file.digest) digestMismatch.push({ relPath: file.relPath, local: file.digest, remote: digest })
@@ -279,7 +406,8 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
     const currentKey = layout.currentKey(source.remote, relPath)
     const versionsPrefix = `${layout.versionsRoot}/`
     const candidates = []
-    for (const entry of await backend.list(versionsPrefix)) {
+    const transport = backendFor(source)
+    for (const entry of await transport.list(versionsPrefix)) {
       if (!entry.key.startsWith(versionsPrefix)) continue
       const rest = entry.key.slice(versionsPrefix.length)
       const [restStamp, restRemote, ...tail] = rest.split('/')
@@ -294,7 +422,7 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
       }
       return { sourceId, relPath, chose: exact[0], currentKey, candidates, note: 'copy the reported key with `rclone copy` or `ossutil cp`; this plugin never downloads by itself' }
     }
-    const head = await backend.head(currentKey)
+    const head = await transport.head(currentKey)
     return {
       sourceId,
       relPath,
@@ -327,12 +455,12 @@ export function createEngine({ config, backend, journal = createJournal({ stateD
         lastIndexedAt: index.updatedAt,
       }
       if (remote) {
-        const listing = await backend.list(layout.currentPrefix(source.remote))
+        const listing = await backendFor(source).list(layout.currentPrefix(source.remote))
         row.remoteObjects = listing.filter(entry => !entry.key.startsWith(`${layout.tempRoot}/`)).length
       }
       return row
     }))
-    return { engine: backend.describe(), stateDir: config.stateDir, remoteListed: remote, sources, runs: recent }
+    return { engine: firstBackend().describe(), stateDir: config.stateDir, remoteListed: remote, sources, runs: recent }
   }
 
   function totalStats(list) {

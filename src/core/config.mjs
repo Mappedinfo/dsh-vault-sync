@@ -67,6 +67,12 @@ function normalizeSource(raw, index) {
   // keep every historical copy sets this to false: a local move or delete then
   // leaves the old remote object in place instead of removing it.
   if (raw.allowRemoteDelete !== undefined && typeof raw.allowRemoteDelete !== 'boolean') fail(`${label}.allowRemoteDelete must be boolean`)
+  // Per-source transfer tuning. One set of values cannot serve both a tree of
+  // notebook-sized files and a collection of 100 MiB PDFs: this deployment lost
+  // 65 large uploads to a client timeout that was tuned for small ones.
+  if (raw.concurrency !== undefined && (!Number.isSafeInteger(raw.concurrency) || raw.concurrency < 1 || raw.concurrency > 24)) fail(`${label}.concurrency must be an integer from 1 to 24`)
+  if (raw.timeoutSeconds !== undefined && (!Number.isSafeInteger(raw.timeoutSeconds) || raw.timeoutSeconds < 5 || raw.timeoutSeconds > 3600)) fail(`${label}.timeoutSeconds must be an integer from 5 to 3600`)
+  if (raw.retries !== undefined && (!Number.isSafeInteger(raw.retries) || raw.retries < 0 || raw.retries > 20)) fail(`${label}.retries must be an integer from 0 to 20`)
   return {
     id,
     kind,
@@ -76,8 +82,28 @@ function normalizeSource(raw, index) {
     exclude: raw.exclude ?? [],
     maxFileBytes: raw.maxFileBytes ?? 512 * 1024 * 1024,
     required: raw.required ?? false,
-    // undefined means "inherit the remote-level setting".
+    // Every per-source override below means "inherit the remote-level setting"
+    // when absent, so an existing config keeps its exact current behaviour.
     ...(raw.allowRemoteDelete === undefined ? {} : { allowRemoteDelete: raw.allowRemoteDelete }),
+    ...(raw.concurrency === undefined ? {} : { concurrency: raw.concurrency }),
+    ...(raw.timeoutSeconds === undefined ? {} : { timeoutSeconds: raw.timeoutSeconds }),
+    ...(raw.retries === undefined ? {} : { retries: raw.retries }),
+  }
+}
+
+/**
+ * Resolve the settings that apply to one source. Written once and shared by the
+ * engine and the plan report so the two can never disagree about, for example,
+ * whether a source prunes or what concurrency it used.
+ */
+export function effectiveSourceSettings(source, remote) {
+  return {
+    allowRemoteDelete: source.allowRemoteDelete ?? remote.allowRemoteDelete,
+    concurrency: source.concurrency ?? remote.concurrency,
+    timeoutSeconds: source.timeoutSeconds ?? remote.timeoutSeconds,
+    retries: source.retries ?? remote.retries,
+    publishStrategy: remote.publishStrategy,
+    archiveFailure: remote.archiveFailure,
   }
 }
 
@@ -93,8 +119,10 @@ function normalizeRemote(raw) {
   if (new Set([currentPrefix, versionsPrefix, tempPrefix]).size !== 3) fail('remote prefixes must be distinct')
   const root = raw.root === undefined ? undefined : requireAbsolute(raw.root, 'remote.root')
   if (type === 'filesystem' && !root) fail('remote.root is required for a filesystem remote')
+  // 'auto' lets the applier lower concurrency when a batch is dominated by large
+  // files, where parallelism starves every transfer instead of helping.
   const concurrency = raw.concurrency ?? 16
-  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 24) fail('remote.concurrency must be an integer from 1 to 24')
+  if (concurrency !== 'auto' && (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 24)) fail('remote.concurrency must be an integer from 1 to 24, or "auto"')
   const engine = raw.engine ?? 'auto'
   if (type === 'oss' && !['auto', 'native', 'rclone'].includes(engine)) fail('remote.engine must be auto, native or rclone')
   for (const key of ['bucket', 'endpoint', 'region', 'rcloneRemote', 'rcloneBinary']) {
@@ -177,6 +205,10 @@ export function configTemplate({ stateDir } = {}) {
       versionsPrefix: 'versions',
       tempPrefix: 'incoming',
       versionRetentionDays: 180,
+      // Tuned for trees of small files. A source full of large objects should
+      // override these (see the note on each source below): a high concurrency
+      // splits one slow uplink into many starving transfers, and a short timeout
+      // aborts a large file that is still making progress.
       concurrency: 16,
       retries: 5,
       timeoutSeconds: 300,

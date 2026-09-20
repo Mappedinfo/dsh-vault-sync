@@ -14,6 +14,7 @@ import { mapLimit } from './util.mjs'
 
 export function createApplier({
   backend,
+  backendForSource,
   layout,
   runId,
   sink = () => {},
@@ -21,21 +22,26 @@ export function createApplier({
   publishStrategy = 'direct',
   concurrency = 8,
   archiveFailure = 'warn',
+  settingsForSource,
+  shouldStop = () => false,
+  onProgress = () => {},
 } = {}) {
   const failures = []
+  const transportFor = source => (backendForSource ? backendForSource(source) : backend)
+  const settingsOf = source => (settingsForSource ? settingsForSource(source) : { concurrency, archiveFailure })
 
-  async function applyItem(item) {
+  async function applyItem(item, transport = backend, settings = { archiveFailure }) {
     switch (item.action) {
       case 'skip':
         return { ...item, status: 'skipped' }
       case 'version': {
-        const existing = await backend.head(item.key)
+        const existing = await transport.head(item.key)
         if (!existing) return { ...item, status: 'skipped', note: 'source-already-absent' }
         try {
-          await backend.copy(item.key, item.versionKey)
+          await transport.copy(item.key, item.versionKey)
           return { ...item, status: 'applied' }
         } catch (error) {
-          if (archiveFailure === 'fail') throw error
+          if (settings.archiveFailure === 'fail') throw error
           // The historical copy could not be written. Report it, but let the
           // paired upload proceed: losing one archived revision is far less bad
           // than leaving the current file unbacked-up.
@@ -43,8 +49,8 @@ export function createApplier({
         }
       }
       case 'delete': {
-        const existing = await backend.head(item.key)
-        if (existing) await backend.remove(item.key)
+        const existing = await transport.head(item.key)
+        if (existing) await transport.remove(item.key)
         return { ...item, status: existing ? 'applied' : 'skipped', note: existing ? undefined : 'already-absent' }
       }
       case 'upload': {
@@ -56,8 +62,8 @@ export function createApplier({
         // The verification below is what closes that window: a size or digest
         // mismatch fails the item, so the next run re-uploads it.
         if (publishStrategy === 'direct') {
-          await backend.putFile(item.key, item.localPath, { size: item.size, digest: item.digest })
-          const landed = await backend.head(item.key)
+          await transport.putFile(item.key, item.localPath, { size: item.size, digest: item.digest })
+          const landed = await transport.head(item.key)
           if (!landed || (landed.size !== undefined && landed.size !== item.size)) {
             throw new BackendError(`published object ${item.key} is missing or short`, { operation: 'verify', key: item.key, retryable: true })
           }
@@ -67,17 +73,17 @@ export function createApplier({
           return { ...item, status: 'applied', verified: Boolean(landed.digest) }
         }
         const tempKey = layout.tempKey(runId, item.remoteName, item.relPath)
-        await backend.putFile(tempKey, item.localPath, { size: item.size, digest: item.digest })
-        const written = await backend.head(tempKey)
+        await transport.putFile(tempKey, item.localPath, { size: item.size, digest: item.digest })
+        const written = await transport.head(tempKey)
         if (!written || (written.size !== undefined && written.size !== item.size)) {
           throw new BackendError(`upload verification failed for ${tempKey}`, { operation: 'verify', key: tempKey, retryable: true })
         }
         if (written.digest && written.digest !== item.digest) {
           throw new BackendError(`upload digest mismatch for ${tempKey}`, { operation: 'verify', key: tempKey })
         }
-        await backend.copy(tempKey, item.key)
-        await backend.remove(tempKey)
-        const landed = await backend.head(item.key)
+        await transport.copy(tempKey, item.key)
+        await transport.remove(tempKey)
+        const landed = await transport.head(item.key)
         if (!landed || (landed.size !== undefined && landed.size !== item.size)) {
           throw new BackendError(`published object ${item.key} is missing or short`, { operation: 'verify', key: item.key, retryable: true })
         }
@@ -97,6 +103,11 @@ export function createApplier({
    * so overlapping them is safe and is what makes a large library feasible:
    * every request on a tunnelled link costs seconds of setup latency, and
    * running them in series multiplies that by the file count.
+   *
+   * The bound comes from the source's effective settings, so a collection of
+   * large objects can run at a lower concurrency than a tree of small ones in
+   * the same round: parallelism that helps many small files starves a few big
+   * ones sharing one uplink.
    */
   async function applySource(source, items, { onItem, onGroup } = {}) {
     const groups = []
@@ -107,12 +118,20 @@ export function createApplier({
       byPath.get(key).push(item)
     }
 
-    const perGroup = await mapLimit(groups, concurrency, async group => {
+    const settings = settingsOf(source)
+    const transport = transportFor(source)
+    const limit = settings.concurrency === 'auto' ? concurrency : (settings.concurrency ?? concurrency)
+    let stopped = false
+    const perGroup = await mapLimit(groups, limit, async group => {
+      // Checked before claiming a group, never inside one: a file's own
+      // archive-then-publish order must run to completion.
+      if (stopped) return []
+      if (shouldStop()) { stopped = true; return [] }
       const results = []
       for (const item of group) {
         const enriched = { ...item, sourceId: source.id, remoteName: source.remote, localPath: item.localPath ?? source.filePaths?.get(item.relPath) }
         try {
-          const result = await applyItem(enriched)
+          const result = await applyItem(enriched, transport, settings)
           results.push(result)
           sink(result)
           onItem?.(result)
@@ -127,10 +146,12 @@ export function createApplier({
       onGroup?.(group, results)
       return results
     })
-    return perGroup.flat()
+    const flat = perGroup.flat()
+    onProgress({ source, settings, planned: groups.length, completed: flat.length, stopped })
+    return flat
   }
 
-  async function pruneTempKeys(remoteEntries) {
+  async function pruneTempKeys(remoteEntries, transport = backend) {
     const stale = (remoteEntries ?? [])
       .filter(entry => entry.key.startsWith(`${layout.tempRoot}/`))
       .filter(entry => entry.key.slice(layout.tempRoot.length + 1).split('/')[0] !== runId)
@@ -138,7 +159,7 @@ export function createApplier({
     const pruned = []
     for (const entry of stale) {
       try {
-        await backend.remove(entry.key)
+        await transport.remove(entry.key)
         pruned.push(entry.key)
       } catch { /* reported again next run */ }
     }

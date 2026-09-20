@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { configTemplate } from '../src/core/config.mjs'
 
 export async function tempDir(prefix = 'vault-sync-test-') {
   return mkdtemp(join(tmpdir(), prefix))
@@ -25,21 +26,23 @@ export async function cleanup(...dirs) {
 export const digestOf = value => createHash('sha256').update(value).digest('hex')
 
 /** A filesystem-shaped config for tests; never touches the network. */
-export function filesystemConfig({ stateDir, remoteRoot, sources }) {
+export function filesystemConfig({ stateDir, remoteRoot, sources, remote = {} }) {
   return {
     version: 1,
     stateDir,
     localRuns: 50,
+    // Built from the shipped template so the fixture can never omit a policy the
+    // engine reads (publishStrategy, archiveFailure): a partial remote silently
+    // produced undefined settings and made tests disagree with real config.
     remote: {
+      ...configTemplate({ stateDir }).remote,
       type: 'filesystem',
       root: remoteRoot,
-      currentPrefix: 'current',
-      versionsPrefix: 'versions',
-      tempPrefix: 'incoming',
       concurrency: 16,
       retries: 0,
       timeoutSeconds: 30,
       allowRemoteDelete: true,
+      ...remote,
     },
     sources: sources.map(source => ({
       include: [],

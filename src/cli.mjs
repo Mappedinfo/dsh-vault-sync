@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import process from 'node:process'
 import { configTemplate, defaultConfigPath, readConfig, writeConfig } from './config-file.mjs'
 import { ENV_FILE_NAME, envFileModeReport, resolveCredentials } from './core/credentials.mjs'
-import { createBackend, createEngine } from './core/engine.mjs'
+import { createBackends, createEngine } from './core/engine.mjs'
+import { effectiveSourceSettings } from './core/config.mjs'
 import { formatBytes, pathExists } from './core/util.mjs'
 import { DEFAULT_RATES, GiB, estimateCosts } from './core/pricing.mjs'
 import { jsonReport, planReport, runReport, statusReport, verifyReport } from './report.mjs'
@@ -81,8 +82,8 @@ function parseArgs(argv) {
 async function loadEngine(options) {
   const config = await readConfig(options.config ?? defaultConfigPath())
   const credentials = await resolveCredentials({ configDir: config.credentialsFile ? undefined : config.stateDir, filePath: config.credentialsFile })
-  const { backend, engine, notes } = await createBackend(config, { credentials })
-  return { engine: createEngine({ config, backend }), config, credentials, transport: engine, notes }
+  const { backends, backendFactory, engine, notes } = await createBackends(config, { credentials })
+  return { engine: createEngine({ config, backends, backendFactory }), config, credentials, transport: engine, notes }
 }
 
 function print(value, options) {
@@ -166,11 +167,26 @@ async function commandDoctor(options) {
     checks.push({ name: 'secrets', ok: true, detail: `not needed for a ${config.remote.type} remote` })
   }
   try {
-    const { backend, engine, notes } = await createBackend(config, { credentials })
-    checks.push({ name: 'transport', ok: true, detail: `${engine}: ${backend.describe().detail}` })
+    const { backends, engine, notes } = await createBackends(config, { credentials })
+    const first = [...backends.values()][0]
+    checks.push({ name: 'transport', ok: true, detail: `${engine}: ${first.describe().detail}` })
     for (const note of notes) checks.push({ name: 'transport-note', ok: true, detail: note })
+    // Surface the resolved policy per source: a source that silently inherited a
+    // timeout meant for small files is the failure this deployment already hit.
+    for (const source of config.sources) {
+      const settings = effectiveSourceSettings(source, config.remote)
+      const tuning = settings.concurrency === 'auto'
+        ? `concurrency auto (timeout ${settings.timeoutSeconds}s, retries ${settings.retries})`
+        : `concurrency ${settings.concurrency}, timeout ${settings.timeoutSeconds}s, retries ${settings.retries}`
+      const overridden = source.concurrency !== undefined || source.timeoutSeconds !== undefined || source.retries !== undefined
+      checks.push({
+        name: `policy:${source.id}`,
+        ok: true,
+        detail: `${tuning}${overridden ? '' : ' (inherited)'}${settings.allowRemoteDelete ? '' : ', append-only'}`,
+      })
+    }
     try {
-      const listing = await backend.list('')
+      const listing = await first.list('')
       checks.push({ name: 'remote-access', ok: true, detail: `${listing.length} objects visible at the remote root` })
     } catch (error) {
       checks.push({ name: 'remote-access', ok: false, detail: error.message })

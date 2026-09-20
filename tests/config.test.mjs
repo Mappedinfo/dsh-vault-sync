@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { configTemplate, normalizeConfig } from '../src/core/config.mjs'
+import { configTemplate, effectiveSourceSettings, normalizeConfig } from '../src/core/config.mjs'
 import { parseEnvFile } from '../src/core/credentials.mjs'
 import { globToRegExp, pathAllowed, mapLimit, joinKey, formatBytes, redactDeep } from '../src/core/util.mjs'
 
@@ -114,4 +114,81 @@ test('concurrent atomic writes to one path never collide on a temp file', async 
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('per-source transfer tuning validates its range and inherits when absent', () => {
+  const template = configTemplate({ stateDir: '/tmp/state' })
+  const withOverride = normalizeConfig({
+    ...template,
+    sources: [{ id: 'a', root: '/tmp/a', concurrency: 4, timeoutSeconds: 1800, retries: 2 }],
+  })
+  assert.equal(withOverride.sources[0].concurrency, 4)
+  assert.equal(withOverride.sources[0].timeoutSeconds, 1800)
+  assert.equal(withOverride.sources[0].retries, 2)
+
+  // Absent means inherit, not "default to something else": the fields must not
+  // be materialised on the source or an existing config would change behaviour.
+  const inherited = normalizeConfig({ ...template, sources: [{ id: 'a', root: '/tmp/a' }] })
+  assert.equal('concurrency' in inherited.sources[0], false)
+  assert.equal('timeoutSeconds' in inherited.sources[0], false)
+  assert.equal('retries' in inherited.sources[0], false)
+
+  for (const [field, value] of [['concurrency', 0], ['concurrency', 25], ['concurrency', 4.5], ['timeoutSeconds', 4], ['timeoutSeconds', 3601], ['retries', -1], ['retries', 21]]) {
+    assert.throws(
+      () => normalizeConfig({ ...template, sources: [{ id: 'a', root: '/tmp/a', [field]: value }] }),
+      new RegExp(`sources\\[0\\]\\.${field}`),
+      `${field}=${value} must be refused`,
+    )
+  }
+})
+
+test('remote concurrency accepts "auto" but not arbitrary strings', () => {
+  const template = configTemplate({ stateDir: '/tmp/state' })
+  assert.equal(normalizeConfig({ ...template, remote: { ...template.remote, concurrency: 'auto' } }).remote.concurrency, 'auto')
+  assert.equal(normalizeConfig({ ...template, remote: { ...template.remote, concurrency: 8 } }).remote.concurrency, 8)
+  for (const value of ['Auto', 'fast', '', 0, 25]) {
+    assert.throws(() => normalizeConfig({ ...template, remote: { ...template.remote, concurrency: value } }), /concurrency/)
+  }
+})
+
+test('effectiveSourceSettings resolves the full inheritance matrix', () => {
+  const template = configTemplate({ stateDir: '/tmp/state' })
+  const config = normalizeConfig({
+    ...template,
+    remote: { ...template.remote, concurrency: 12, timeoutSeconds: 600, retries: 7, allowRemoteDelete: true },
+    sources: [
+      { id: 'inherit', root: '/tmp/inherit' },
+      { id: 'concurrency', root: '/tmp/c', concurrency: 2 },
+      { id: 'timeout', root: '/tmp/t', timeoutSeconds: 1800 },
+      { id: 'retries', root: '/tmp/r', retries: 0 },
+      { id: 'delete', root: '/tmp/d', allowRemoteDelete: false },
+      { id: 'everything', root: '/tmp/e', concurrency: 24, timeoutSeconds: 3600, retries: 20, allowRemoteDelete: false },
+    ],
+  })
+  const settings = id => effectiveSourceSettings(config.sources.find(s => s.id === id), config.remote)
+
+  assert.deepEqual(settings('inherit'), { allowRemoteDelete: true, concurrency: 12, timeoutSeconds: 600, retries: 7, publishStrategy: 'direct', archiveFailure: 'warn' })
+  // Each override is independent: setting one must not reset the others.
+  assert.equal(settings('concurrency').concurrency, 2)
+  assert.equal(settings('concurrency').timeoutSeconds, 600)
+  assert.equal(settings('concurrency').retries, 7)
+  assert.equal(settings('timeout').timeoutSeconds, 1800)
+  assert.equal(settings('timeout').concurrency, 12)
+  // 0 must survive as 0 rather than being treated as falsy and replaced.
+  assert.equal(settings('retries').retries, 0)
+  assert.equal(settings('delete').allowRemoteDelete, false)
+  assert.equal(settings('delete').concurrency, 12)
+  assert.deepEqual(settings('everything'), { allowRemoteDelete: false, concurrency: 24, timeoutSeconds: 3600, retries: 20, publishStrategy: 'direct', archiveFailure: 'warn' })
+})
+
+test('effectiveSourceSettings carries the remote-level policies through unchanged', () => {
+  const template = configTemplate({ stateDir: '/tmp/state' })
+  const config = normalizeConfig({
+    ...template,
+    remote: { ...template.remote, publishStrategy: 'temp-copy', archiveFailure: 'fail' },
+    sources: [{ id: 'a', root: '/tmp/a' }],
+  })
+  const settings = effectiveSourceSettings(config.sources[0], config.remote)
+  assert.equal(settings.publishStrategy, 'temp-copy')
+  assert.equal(settings.archiveFailure, 'fail')
 })
