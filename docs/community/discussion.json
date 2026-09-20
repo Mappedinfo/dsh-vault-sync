@@ -7,10 +7,11 @@
   },
   "title": "DSH | Vault Sync | 把本地研究资料单向、可版本化地备份到阿里云 OSS",
   "category": "Show Your Plugins!",
-  "bodySha256": "d874a8368682cfb191c3ceb3ca3aa4baffe57eccefe401f4eac85027217a2e4c",
+  "bodySha256": "182ba428805b545ddebf6caf49da36dcf04c232419b1a18d2a3db809552f4815",
   "images": [
     "docs/community/images/doctor.png",
     "docs/community/images/versioning.png"
   ],
-  "publishedAt": "2026-09-20T11:55:24.854Z"
+  "publishedAt": "2026-09-20T11:55:24.854Z",
+  "updatedAt": "2026-09-20T12:14:12.400Z"
 }

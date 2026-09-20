@@ -10,12 +10,14 @@
  *
  *   node scripts/publish-showcase.mjs            # preflight only
  *   node scripts/publish-showcase.mjs --publish  # create the discussion
+ *   node scripts/publish-showcase.mjs --update   # replace the body of the
+ *     discussion recorded in docs/community/discussion.json (for a correction)
  */
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 
-const ALLOWED = new Set(['--publish'])
+const ALLOWED = new Set(['--publish', '--update'])
 const options = new Set(process.argv.slice(2))
 for (const option of options) if (!ALLOWED.has(option)) throw new Error(`unknown option ${option}`)
 
@@ -60,7 +62,12 @@ const search = graphql(`query($q:String!) { search(query:$q, type:DISCUSSION, fi
   { q: `repo:${config.repository} author:${viewer} "Vault Sync" in:title` }).search
 check('duplicate check bounded', search.discussionCount <= 50, `search returned ${search.discussionCount} results`)
 const duplicates = search.nodes.filter(node => node.title?.startsWith('DSH | Vault Sync |'))
-check('no existing post', duplicates.length === 0, `already posted: ${duplicates.map(d => d.url).join(', ')}`)
+if (options.has('--update')) {
+  // Replacing the recorded post is the point; anything else is a surprise.
+  check('update targets the recorded post', duplicates.length === 1, `expected exactly one existing post, found ${duplicates.length}`)
+} else {
+  check('no existing post', duplicates.length === 0, `already posted: ${duplicates.map(d => d.url).join(', ')}`)
+}
 
 // The discussion renders images from GitHub, so they must be public at exactly
 // the bytes reviewed here; a mismatch means the post would show something else.
@@ -76,8 +83,26 @@ process.stdout.write(`\npreflight: OK (${checks.length} checks, author ${viewer}
 process.stdout.write(`title: ${config.title}\n`)
 process.stdout.write(`body:  ${config.bodyFile} (${body.length} bytes, ${config.images.length} screenshots)\n`)
 
+if (options.has('--update')) {
+  const receipt = JSON.parse(await readFile('docs/community/discussion.json', 'utf8'))
+  check('receipt author is this account', receipt.author === viewer, `receipt belongs to ${receipt.author}`)
+  const updated = graphql(`mutation($input:UpdateDiscussionInput!) {
+    updateDiscussion(input:$input) { discussion { id url number } } }`,
+    { input: { discussionId: receipt.discussion.id, body } }).updateDiscussion.discussion
+  process.stdout.write(`\nupdated: ${updated.url}\n`)
+  const readBackUpdated = graphql(`query($id:ID!) { node(id:$id) { ... on Discussion { title url body } } }`, { id: updated.id }).node
+  check('body replaced', readBackUpdated.body.trim() === body.trim(), 'the published body does not match the reviewed file')
+  await writeFile('docs/community/discussion.json', `${JSON.stringify({
+    ...receipt,
+    bodySha256: sha256(Buffer.from(body)),
+    updatedAt: new Date().toISOString(),
+  }, null, 2)}\n`)
+  process.stdout.write('receipt updated\n')
+  process.exit(0)
+}
+
 if (!options.has('--publish')) {
-  process.stdout.write('\nDry run. Re-run with --publish to create the discussion.\n')
+  process.stdout.write('\nDry run. Re-run with --publish to create the discussion, or --update to correct it.\n')
   process.exit(0)
 }
 

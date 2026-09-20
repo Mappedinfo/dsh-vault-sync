@@ -48,7 +48,8 @@
     "validate": "node scripts/validate.mjs",
     "install:harness": "node scripts/install-harness.mjs",
     "check:publication": "node scripts/check-publication.mjs --history",
-    "publish:showcase": "node scripts/publish-showcase.mjs"
+    "publish:showcase": "node scripts/publish-showcase.mjs",
+    "update:showcase": "node scripts/publish-showcase.mjs --update"
   },
   "dependencies": {},
   "peerDependencies": {
