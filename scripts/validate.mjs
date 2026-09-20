@@ -67,32 +67,40 @@ async function main() {
       await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`)
 
       const cli = (...args) => capture(process.execPath, [join(ROOT, 'src', 'cli.mjs'), ...args, '--json', '--config', configPath])
-      const first = JSON.parse((await cli('run')).stdout)
+      const parse = async (...args) => {
+        const outcome = await cli(...args)
+        try {
+          return JSON.parse(outcome.stdout)
+        } catch (error) {
+          throw new Error(`vault-sync ${args.join(' ')} returned unparsable JSON (exit ${outcome.code}): ${error.message}; stderr=${outcome.stderr.slice(0, 400)}`)
+        }
+      }
+      const first = await parse('run')
       if (first.totals.upload !== 3 || first.totals.failed !== 0) throw new Error(`first run uploaded ${first.totals.upload}, failed ${first.totals.failed}`)
 
-      const second = JSON.parse((await cli('run')).stdout)
+      const second = await parse('run')
       if (second.totals.upload !== 0 || second.totals.unchanged !== 3) throw new Error(`second run was not idempotent: upload ${second.totals.upload}, unchanged ${second.totals.unchanged}`)
 
       await writeFile(join(library, '2024', 'a.pdf'), 'synthetic-one-modified')
       await rm(join(library, '2024', 'b.pdf'))
-      const third = JSON.parse((await cli('run')).stdout)
+      const third = await parse('run')
       if (third.totals.upload !== 1 || third.totals.version !== 2 || third.totals.delete !== 1) {
         throw new Error(`third run wrong: upload ${third.totals.upload}, version ${third.totals.version}, delete ${third.totals.delete}`)
       }
       const archived = await readFile(join(remote, 'versions', new Date().toISOString().slice(0, 10), 'papers', '2024', 'b.pdf'), 'utf8').catch(() => undefined)
       if (archived !== 'synthetic-two') throw new Error('the deleted file was not archived before removal')
 
-      const verified = JSON.parse((await cli('verify')).stdout)
+      const verified = await parse('verify')
       if (!verified.ok) throw new Error('verify reported a mismatch after a clean run')
 
-      const plan = JSON.parse((await cli('plan')).stdout)
+      const plan = await parse('plan')
       if (plan.totals.upload !== 0) throw new Error('plan after a clean run still wants to upload')
 
-      const status = JSON.parse((await cli('status')).stdout)
+      const status = await parse('status')
       const runs = status.runs.length
       if (runs < 3) throw new Error(`expected at least 3 recorded runs, saw ${runs}`)
 
-      const cost = JSON.parse((await cli('cost')).stdout)
+      const cost = await parse('cost')
       if (!(cost.totalPerYear >= 0) || cost.currency !== 'CNY') throw new Error('cost estimate is malformed')
 
       return `3 uploads, idempotent re-run, 1 modification archived, 1 deletion archived, verify ok, ${runs} runs recorded`
@@ -112,6 +120,24 @@ async function main() {
     return `${TOOL_SPECS.length} tools and the bundled skill load without the Harness runtime`
   })
   steps.push({ name: 'harness-contract', ...harness })
+
+  const progressCheck = await step('progress-visibility', async () => {
+    const { createProgressTracker } = await import(join(ROOT, 'src', 'core', 'progress.mjs'))
+    const root = await mkdtemp(join(tmpdir(), 'vault-progress-'))
+    try {
+      const tracker = createProgressTracker({ stateDir: root, runId: 'validate', minEvents: 250, throttleMs: 60_000 })
+      await tracker.sourceScanned('s', 3)
+      await tracker.fileDone({ sourceId: 's', relPath: 'a', status: 'applied', bytes: 1 })
+      await tracker.finish('interrupted')
+      const document = JSON.parse(await readFile(tracker.path, 'utf8'))
+      if (document.totals.done !== 1) throw new Error('progress did not record the finished file')
+      if (document.status !== 'interrupted') throw new Error('progress status not recorded')
+      return 'a source smaller than any flush threshold is still visible while it runs'
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+  steps.push({ name: 'progress-visibility', ...progressCheck })
 
   const failures = steps.filter(step => !step.ok)
   process.stdout.write(`\nvault-sync validation: ${failures.length === 0 ? 'PASS' : 'FAIL'} (${steps.length} checks)\n`)

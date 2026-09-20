@@ -275,3 +275,47 @@ test('a source that fails to plan does not abort the sources that are healthy', 
     await cleanup(root)
   }
 })
+
+test('concurrency auto lowers the bound when a batch is dominated by large files', async () => {
+  const { autoConcurrency, LARGE_FILE_BYTES } = await import('../src/core/applier.mjs')
+  const small = Array.from({ length: 200 }, () => [{ size: 4 * 1024 }])
+  const big = Array.from({ length: 60 }, () => [{ size: LARGE_FILE_BYTES * 3 }])
+
+  // Small files: parallelism is pure latency hiding, so keep the ceiling.
+  assert.equal(autoConcurrency(small, 16), 16)
+  // Many large files: 24/sqrt(60) ~ 3, clamped to at least 2.
+  const bigLimit = autoConcurrency(big, 16)
+  assert.ok(bigLimit >= 2 && bigLimit <= 6, `expected a low bound for large files, saw ${bigLimit}`)
+  // A single large file still gets a couple of slots.
+  assert.equal(autoConcurrency([[{ size: LARGE_FILE_BYTES }]], 16), 16)
+  // The source's own ceiling is never exceeded.
+  assert.ok(autoConcurrency(big, 4) <= 4)
+  // A non-numeric ceiling (the 'auto' literal) must not produce NaN.
+  assert.ok(Number.isFinite(autoConcurrency(small, 'auto')))
+})
+
+test('concurrency auto is honoured end to end and reported (not silently replaced)', async () => {
+  const root = await tempDir('vault-auto-')
+  try {
+    const library = join(root, 'lib')
+    const files = {}
+    for (let i = 0; i < 8; i += 1) files[`big-${i}.bin`] = 'x'.repeat(1024)
+    await writeFiles(library, files)
+    const config = normalizeConfig(filesystemConfig({
+      stateDir: join(root, 'state'),
+      remoteRoot: join(root, 'remote'),
+      remote: { concurrency: 'auto' },
+      sources: [{ id: 'lib', root: library, remote: 'lib' }],
+    }))
+    assert.equal(config.remote.concurrency, 'auto')
+    const engine = createEngine({ config, backend: createFilesystemBackend({ root: join(root, 'remote') }), now: () => new Date('2026-06-01T00:00:00Z') })
+    const result = await engine.run({})
+    assert.equal(result.totals.upload, 8)
+    assert.equal(result.totals.failed, 0)
+    // The plan reports what the source will actually use.
+    const plan = await engine.plan({})
+    assert.equal(plan.summary[0].effective.concurrency, 'auto')
+  } finally {
+    await cleanup(root)
+  }
+})

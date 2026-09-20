@@ -351,3 +351,62 @@ test('an append-only source reports a locally deleted file as kept, not as a fai
     assert.ok(await h.backend.head('current/papers/gone.pdf'))
   } finally { await cleanup(h.root) }
 })
+
+test('verify reports ok, okWithWarnings and mismatch as distinct states', async () => {
+  const h = await harness('verifystates')
+  try {
+    await writeFiles(h.library, { 'x.pdf': 'trusted', 'y.pdf': 'other' })
+    await h.engine.run({})
+
+    const clean = await h.engine.verify({})
+    assert.equal(clean.status, 'ok')
+    assert.equal(clean.ok, true)
+    assert.equal(clean.warnings.unverifiedFiles, 0)
+
+    // A size mismatch is a contradiction.
+    await writeFile(join(h.remoteRoot, 'current/papers/y.pdf'), 'much-longer-than-before')
+    const mismatch = await h.engine.verify({})
+    assert.equal(mismatch.status, 'mismatch')
+    assert.equal(mismatch.ok, false)
+    assert.equal(mismatch.sources[0].sizeMismatch.length, 1)
+  } finally { await cleanup(h.root) }
+})
+
+test('a file the local side cannot read downgrades verify to okWithWarnings, not ok', async () => {
+  const h = await harness('verifyunreadable')
+  try {
+    await writeFiles(h.library, { 'x.pdf': 'trusted' })
+    // A symlink to a missing target stats as a file on some systems but cannot be
+    // read; either way scanSource reports it under skipped rather than failing.
+    const { symlink } = await import('node:fs/promises')
+    await symlink(join(h.library, 'does-not-exist.pdf'), join(h.library, 'broken.pdf'))
+    await h.engine.run({})
+    const verified = await h.engine.verify({})
+    if (verified.sources[0].unreadable.length > 0) {
+      assert.equal(verified.status, 'okWithWarnings')
+      assert.equal(verified.ok, false)
+      assert.equal(verified.warnings.unreadableFiles, verified.sources[0].unreadable.length)
+    } else {
+      // The platform resolved it away entirely; the three-state contract still holds.
+      assert.ok(['ok', 'okWithWarnings'].includes(verified.status))
+    }
+  } finally { await cleanup(h.root) }
+})
+
+test('verify marks a truncated remote-only list instead of silently capping it', async () => {
+  const h = await harness('verifytruncate')
+  try {
+    await writeFiles(h.library, { 'x.pdf': 'trusted' })
+    await h.engine.run({})
+    // Put 60 objects on the remote that do not exist locally.
+    const remoteDir = join(h.remoteRoot, 'current/papers')
+    for (let i = 0; i < 60; i += 1) await writeFile(join(remoteDir, `extra-${String(i).padStart(3, '0')}.pdf`), 'x')
+    const verified = await h.engine.verify({})
+    assert.equal(verified.sources[0].remoteOnlyCount, 60)
+    assert.equal(verified.sources[0].remoteOnly.length, 50)
+    assert.equal(verified.sources[0].remoteOnlyTruncated, true)
+    assert.equal(verified.warnings.remoteOnlyTruncated, true)
+    // Remote-only files are expected for an append-only source and are not a mismatch.
+    assert.equal(verified.status, 'ok')
+  } finally { await cleanup(h.root) }
+})

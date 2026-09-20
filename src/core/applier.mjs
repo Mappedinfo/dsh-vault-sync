@@ -12,6 +12,26 @@
 import { BackendError } from './backend.mjs'
 import { mapLimit } from './util.mjs'
 
+/** A file at or above this size competes for the uplink rather than merely for latency. */
+export const LARGE_FILE_BYTES = 16 * 1024 * 1024
+
+/**
+ * Lower the concurrency when a batch is dominated by large files.
+ *
+ * Parallelism buys latency hiding, which is what a tree of small files needs.
+ * It does not buy bandwidth: splitting a slow uplink sixteen ways makes every
+ * transfer too slow to finish inside any sane timeout, which is exactly how this
+ * deployment lost 65 large uploads. The bound falls off with the square root of
+ * the large-file count so it degrades gently, and never drops below 2.
+ */
+export function autoConcurrency(groups, ceiling = 16, threshold = LARGE_FILE_BYTES) {
+  const largeFiles = (groups ?? []).filter(group => (group[0]?.size ?? 0) >= threshold).length
+  const safeCeiling = Math.max(1, Number.isFinite(ceiling) && ceiling !== 'auto' ? ceiling : 16)
+  if (largeFiles === 0) return Math.min(safeCeiling, 16)
+  const derived = Math.round(24 / Math.sqrt(largeFiles))
+  return Math.max(2, Math.min(safeCeiling, derived))
+}
+
 export function createApplier({
   backend,
   backendForSource,
@@ -121,7 +141,10 @@ export function createApplier({
 
     const settings = settingsOf(source)
     const transport = transportFor(source)
-    const limit = settings.concurrency === 'auto' ? concurrency : (settings.concurrency ?? concurrency)
+    const auto = settings.concurrency === 'auto'
+    const limit = auto
+      ? autoConcurrency(groups, concurrency)
+      : (settings.concurrency ?? concurrency)
     let stopped = false
     const perGroup = await mapLimit(groups, limit, async group => {
       // Checked before claiming a group, never inside one: a file's own

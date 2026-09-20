@@ -2,6 +2,19 @@
 
 ## 未发布
 
+### 新增（可观测性与按源参数）
+- **逐源调参**：`concurrency` / `timeoutSeconds` / `retries` 可按源覆盖，缺省继承；`concurrency: "auto"` 按文件大小自动降档。
+- **运行中进度**：独立瞬态文件 + `progress` 命令 + `status` 进度行，均为零网络本地读取。
+- **优雅收尾**：第一次 SIGINT/SIGTERM 停止领新文件、落盘 `interrupted` 记录与进度、释放锁，退出码 130。
+- 失败与归档警告**即时**打印（`--quiet` 也不抑制失败）。
+- `verify` 三态：`ok` / `okWithWarnings` / `mismatch`，并标出 `remoteOnlyTruncated`。
+- 单源失败不再中断整轮；该源记录 `error` 且不推进索引。
+
+### 修复（本轮）
+- 引擎向 applier 传递被拆平的 source，使按源参数被静默忽略。
+- 优雅停止时索引仍推进到完整扫描，把未上传的文件记成已备份。
+- 计划失败的源丢失了错误信息，使一轮看似完成。
+
 ### 修复
 - **传输层错误不再中断整轮**：连接超时、连接重置、`fetch failed` 等此前被当作致命错误，现在会退避重试；`SignatureDoesNotMatch` 也归入可重试（VPN 隧道会损坏请求），而 `InvalidAccessKeyId`、`AccessDenied` 仍快速失败。
 - **并发写临时文件碰撞**：`atomicWrite` 用 `pid+毫秒` 命名临时文件，同毫秒并发写会互抢导致 `rename` 失败——而摘要索引与远端元数据都走这个函数。已加随机后缀。

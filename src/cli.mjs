@@ -51,6 +51,7 @@ cost options
 
 restore options
   --stamp <YYYY-MM-DD> pin a dated version
+  --progress-interval <ms>  live progress line interval (default 2000)
 
 status options
   --remote             also list the remote prefixes (billed, proportional to object count)
@@ -79,6 +80,7 @@ function parseArgs(argv) {
     else if (arg === '--sporadic-objects') options.sporadicObjects = Number(argv[++i])
     else if (arg === '--egress') options.egressWindow = argv[++i]
     else if (arg === '--storage-class') options.storageClass = argv[++i]
+    else if (arg === '--progress-interval') options.progressIntervalMs = Number(argv[++i])
     else if (arg === '--remote') options.remote = true
     else if (arg === '--help' || arg === '-h') options.help = true
     else if (arg.startsWith('-')) throw new Error(`unknown option ${arg}`)
@@ -238,6 +240,22 @@ async function commandRun(options) {
     ['SIGTERM', () => onSignal('SIGTERM')],
   ]
   for (const [signal, handler] of handlers) process.on(signal, handler)
+  // A long upload should say it is alive. TTY rewrites one line; a pipe or a log
+  // gets whole lines so cron output stays greppable. --json suppresses it so the
+  // machine-readable contract on stdout stays clean.
+  const showLive = !options.json && process.env.VAULT_SYNC_PROGRESS !== '0' && !options.quiet
+  const live = showLive
+    ? setInterval(() => {
+        void engine.progress().then(rows => {
+          const row = rows.find(entry => entry.status === 'running')
+          if (!row) return
+          const line = progressLine(row)
+          if (!line) return
+          process.stderr.write(process.stderr.isTTY ? `\r${line}` : `${line}\n`)
+        }).catch(() => {})
+      }, options.progressIntervalMs ?? 2000)
+    : undefined
+  if (live?.unref) live.unref()
   let result
   try {
     result = await engine.run({
@@ -247,6 +265,8 @@ async function commandRun(options) {
       control: { shouldStop: () => stop.requested },
     })
   } finally {
+    if (live) clearInterval(live)
+    if (showLive && process.stderr.isTTY) process.stderr.write('\r\x1b[K')
     for (const [signal, handler] of handlers) process.removeListener(signal, handler)
   }
   // --json always wins: the quiet one-liner is a human convenience only.
@@ -260,6 +280,17 @@ async function commandRun(options) {
   }
   if (result.interrupted) return 130
   return result.totals.failed > 0 ? 1 : 0
+}
+
+/** One line summarising a live run, or undefined when there is nothing to say. */
+function progressLine(row) {
+  const totals = row.totals ?? {}
+  if (!totals.planned) return undefined
+  const percent = ((totals.done / totals.planned) * 100).toFixed(1)
+  const rate = row.ratePerSec ? `  ${row.ratePerSec} files/s` : ''
+  const eta = row.etaSeconds ? `  ETA ${Math.max(1, Math.round(row.etaSeconds / 60))}m` : ''
+  const failed = totals.failed ? `  ${totals.failed} failed` : ''
+  return `[${totals.done}/${totals.planned} ${percent}%] ${totals.bytesHuman ?? ''}${rate}${eta}${failed}`
 }
 
 /**
@@ -304,12 +335,13 @@ async function commandVerify(options) {
   const { engine } = await loadEngine(options)
   const result = await engine.verify({ only: options.source, sample: options.sample })
   print(options.json ? result : verifyReport(result), options)
-  return result.ok ? 0 : 1
+  // Warnings are not a mismatch: only a real contradiction fails the command.
+  return result.status === 'mismatch' ? 1 : 0
 }
 
 async function commandCost(options) {
   const { engine, config } = await loadEngine(options)
-  const objects = (await engine.backend.list('')).filter(entry => !entry.key.startsWith(`${engine.layout.tempRoot}/`))
+  const objects = (await engine.listRemote('')).filter(entry => !entry.key.startsWith(`${engine.layout.tempRoot}/`))
   const storedBytes = objects.reduce((sum, entry) => sum + (entry.size ?? 0), 0)
   const objectCount = objects.length
   const indexes = await Promise.all(config.sources.map(async source => (await engine.journal.readIndex(source.id)).entries ?? {}))

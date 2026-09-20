@@ -48,7 +48,11 @@ export function runReport(result) {
   out += `  deletes    ${result.totals.delete}\n`
   out += `  failed     ${result.totals.failed}\n`
   out += `  temp-pruned ${(result.tempPruned ?? []).length}\n`
-  out += `  status     ${result.record?.status}\n\n`
+  out += `  status     ${result.record?.status}\n`
+  if (result.totals.archiveWarnings) out += `  archive    ${result.totals.archiveWarnings} version(s) could not be archived (warned, not failed)\n`
+  if (result.totals.pending) out += `  pending    ${result.totals.pending} source(s) never reached\n`
+  if (result.progressPath && result.interrupted) out += `  progress   ${result.progressPath}\n`
+  out += '\n'
   out += table(result.perSource, [
     { header: 'source', value: row => row.id },
     { header: 'scanned', value: row => row.scanned },
@@ -60,6 +64,8 @@ export function runReport(result) {
     { header: 'skipped-local', value: row => row.skippedLocal.length },
   ])
   for (const source of result.perSource) {
+    if (source.error) out += `  ! ${source.id}: source failed: ${source.error}\n`
+    if (source.pending) out += `  - ${source.id}: not reached (run stopped)\n`
     for (const failure of source.failed) out += `  ! ${source.id}/${failure.relPath} (${failure.action}): ${failure.error}\n`
     for (const skipped of source.skippedLocal.slice(0, 5)) out += `  ~ ${source.id}/${skipped.path}: ${skipped.reason}\n`
   }
@@ -67,7 +73,17 @@ export function runReport(result) {
 }
 
 export function verifyReport(result) {
-  let out = `vault-sync verify: ${result.ok ? 'OK' : 'MISMATCH'} (${result.checked} files checked)\n\n`
+  const label = result.status === 'ok' ? 'OK' : result.status === 'okWithWarnings' ? 'OK WITH WARNINGS' : 'MISMATCH'
+  let out = `vault-sync verify: ${label} (${result.checked} files checked)\n`
+  if (result.warnings) {
+    const parts = []
+    if (result.warnings.unreadableFiles) parts.push(`${result.warnings.unreadableFiles} unreadable`)
+    if (result.warnings.unverifiedFiles) parts.push(`${result.warnings.unverifiedFiles} not digest-verified`)
+    if (result.warnings.sampled) parts.push('sampled')
+    if (result.warnings.remoteOnlyTruncated) parts.push('remote-only list truncated at 50')
+    if (parts.length) out += `  warnings: ${parts.join(', ')}\n`
+  }
+  out += '\n'
   out += table(result.sources, [
     { header: 'source', value: row => row.id },
     { header: 'local', value: row => row.local },

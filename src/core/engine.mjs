@@ -462,6 +462,14 @@ export function createEngine({
       }
       const localPaths = new Set(scan.files.map(file => file.relPath))
       const remoteOnly = [...remoteByPath.keys()].filter(relPath => !localPaths.has(relPath))
+      const truncated = remoteOnly.length > 50
+      // ok means "nothing contradicts the local copy". A file the local side
+      // could not read, or one no digest could be compared against, is not a
+      // contradiction but it is also not a clean verification, so it gets its own
+      // state instead of being hidden behind a bare true.
+      const mismatch = missing.length > 0 || sizeMismatch.length > 0 || digestMismatch.length > 0
+      const warned = scan.skipped.length > 0 || digestUnavailable > 0
+      const status = mismatch ? 'mismatch' : (warned ? 'okWithWarnings' : 'ok')
       report.push({
         id: source.id,
         remote: source.remote,
@@ -469,17 +477,34 @@ export function createEngine({
         local: scan.files.length,
         remoteTotal: remoteByPath.size,
         checked: sampleFiles.length,
+        sampled: sampleFiles.length !== scan.files.length,
         missing,
         sizeMismatch,
         digestMismatch,
         digestUnavailable,
         remoteOnly: remoteOnly.slice(0, 50),
         remoteOnlyCount: remoteOnly.length,
+        remoteOnlyTruncated: truncated,
         unreadable: scan.skipped,
-        ok: missing.length === 0 && sizeMismatch.length === 0 && digestMismatch.length === 0,
+        status,
+        ok: status === 'ok',
       })
     }
-    return { checked, sources: report, ok: report.every(entry => entry.ok) }
+    const status = report.some(entry => entry.status === 'mismatch')
+      ? 'mismatch'
+      : (report.some(entry => entry.status === 'okWithWarnings') ? 'okWithWarnings' : 'ok')
+    return {
+      checked,
+      status,
+      ok: status === 'ok',
+      sources: report,
+      warnings: {
+        unreadableFiles: report.reduce((sum, entry) => sum + entry.unreadable.length, 0),
+        unverifiedFiles: report.reduce((sum, entry) => sum + entry.digestUnavailable, 0),
+        remoteOnlyTruncated: report.some(entry => entry.remoteOnlyTruncated),
+        sampled: report.some(entry => entry.sampled),
+      },
+    }
   }
 
   /** Locate a current object or a dated archived version. */
@@ -573,6 +598,8 @@ export function createEngine({
     backend,
     layout,
     progress: () => readProgress(config.stateDir),
+    // Used by cost, which needs the whole-object picture rather than a source view.
+    listRemote: prefix => firstBackend().list(prefix),
     journal,
     plan,
     run,
